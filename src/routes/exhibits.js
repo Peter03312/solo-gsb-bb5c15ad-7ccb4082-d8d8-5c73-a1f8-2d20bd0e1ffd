@@ -5,7 +5,7 @@ const { query, withTransaction, withExhibitTransaction } = require('../db');
 const { requireRole } = require('../auth');
 const { recordAudit } = require('../audit');
 const { ValidationError, ConflictError, nonEmptyString, positiveNumber } = require('../validation');
-const { computeOccupancy, lockExhibit, decoratePlans, computeLimitPreview } = require('../service');
+const { computeOccupancy, lockExhibit, decoratePlans, computeLimitPreview, touchOccupancyYears, affectedYearsForPlans } = require('../service');
 const { tsToWallString } = require('../dosing');
 const { fingerprintSnapshot, issueVoucher, peekVoucher, consumeVoucher } = require('../limit-preview');
 const {
@@ -221,6 +221,13 @@ async function applyLowerAndFlag(client, actor, exhibitId, year, previousLimit, 
     }
   }
 
+  // 上限下调本身不改剂量，但被转待复核的计划撤回估算残余：仅重算这些计划窗涉及的年份，
+  // 使后续展品详情/预警读到最终占用（同事务；未转任何计划时为空操作）。
+  if (flagged.length > 0) {
+    const ys = await affectedYearsForPlans(client, flagged.map((f) => f.id));
+    await touchOccupancyYears(client, exhibitId, ys);
+  }
+
   await recordAudit(client, actor, auditAction, 'exhibit', exhibitId, {
     year,
     previousLimit,
@@ -408,10 +415,15 @@ router.post('/:id/limits/lower', requireRole('conservator'), async (req, res, ne
         client, req.sessionUser, exhibitId, year, previousLimit, preview,
         { auditAction: 'limit.lower' }
       );
+      const loweredYears = flagged.length > 0
+        ? [...new Set([year, ...(await affectedYearsForPlans(client, flagged.map((f) => f.id)))])]
+        : [year];
 
       // 上限下调：同一展品锁事务内重算分级预警边沿（可能向上跨档）
       const { events: alertEvents } = await alerts.recomputeAlerts(
-        client, exhibitId, { actor: req.sessionUser, trigger: { type: 'limit.change', detail: {
+        client, exhibitId, {
+          years: loweredYears,
+          actor: req.sessionUser, trigger: { type: 'limit.change', detail: {
           year, previousLimit, newLimit: limitLxh, viaVoucher: true,
         } } }
       );
@@ -503,8 +515,14 @@ router.post('/:id/limits', requireRole('conservator'), async (req, res, next) =>
       }
 
       // 上限变更：在同一展品锁事务内按统一剂量口径重算分级预警边沿（上限下调路径同样适用）
+      const changedYears = lowerOutcome.flagged.length > 0
+        ? [...new Set([year, ...(await affectedYearsForPlans(
+            client, lowerOutcome.flagged.map((f) => f.id)))])]
+        : [year];
       const { events: alertEvents } = await alerts.recomputeAlerts(
-        client, exhibitId, { actor: req.sessionUser, trigger: { type: 'limit.change', detail: {
+        client, exhibitId, {
+          years: changedYears,
+          actor: req.sessionUser, trigger: { type: 'limit.change', detail: {
           year, previousLimit, newLimit: limitLxh,
         } } }
       );

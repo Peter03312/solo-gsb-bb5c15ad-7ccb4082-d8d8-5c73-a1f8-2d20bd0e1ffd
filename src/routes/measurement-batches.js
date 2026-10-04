@@ -24,6 +24,8 @@ const {
   evaluateMeasurementBatch,
   overflowInfoFromOccupancy,
   flagPlansForOverflow,
+  touchOccupancyYears,
+  affectedYearsForPlans,
 } = require('../service');
 const { round3 } = require('../dosing');
 const { parseMeasurementCsvRows } = require('../csv');
@@ -449,10 +451,12 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         measurementIds.push(Number(ins.rows[0].id));
       }
 
+      // 批次实测生效：仅重算整批剂量影响到的自然年（各年实测替代其计划残余，跨年同步）。
+      const candidateYearsList = Object.keys(totalYearly).map(Number);
+      await touchOccupancyYears(client, exhibitId, candidateYearsList);
       // 实时占用（新实测已入账）：找出本次剂量影响年份的超额
       const occupancy = await computeOccupancy(client, exhibitId);
-      const candidateYears = Object.keys(totalYearly).map(Number);
-      const { overflows, overflowYears } = overflowInfoFromOccupancy(occupancy, candidateYears);
+      const { overflows, overflowYears } = overflowInfoFromOccupancy(occupancy, candidateYearsList);
 
       // 超限仍入账：相关年度尚未开始且有估算残余的已批准计划转待复核（既有规则）
       let flagged = [];
@@ -464,11 +468,17 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
           trigger: { triggerMeasurementBatchId: id },
           reason: () => `实测批次 #${id} 确认后导致 ${overflowYears.join('、')} 年额度超限，转待复核`,
         });
+        if (flagged.length > 0) {
+          const ys = await affectedYearsForPlans(client, flagged.map((f) => f.id));
+          await touchOccupancyYears(client, exhibitId, ys);
+        }
       }
 
       // 批次确认入账（含可能的待复核转态）后：锁事务内重算分级预警边沿
       const { events: alertEvents } = await alerts.recomputeAlerts(
         client, exhibitId, {
+          years: [...new Set([...candidateYearsList,
+            ...(flagged.length > 0 ? await affectedYearsForPlans(client, flagged.map((f) => f.id)) : [])])],
           actor: req.sessionUser,
           trigger: {
             type: 'measurement_batch.confirm',

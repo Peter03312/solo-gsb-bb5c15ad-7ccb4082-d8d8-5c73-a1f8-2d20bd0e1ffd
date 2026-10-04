@@ -17,6 +17,8 @@ const {
   validateMeasurementWindow,
   correctMeasurement,
   computeOccupancy,
+  touchOccupancyYears,
+  affectedYearsForPlans,
   overflowInfoFromOccupancy,
   flagPlansForOverflow,
   findOverlappingSharedLighting,
@@ -172,8 +174,9 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         );
       }
 
-      // 预演确认后的额度占用
-      const occupancy = await computeOccupancy(client, plan.exhibit_id, {
+      // 预演确认后的额度占用（试算，不写派生表；与确认后的局部重算同口径）。
+      // 保留历史“先预判、再决定超额响应”的顺序，但实际数值以确认后局部重算为准。
+      const projected = await computeOccupancy(client, plan.exhibit_id, {
         extraMeasurement: {
           planId: plan.id,
           start,
@@ -181,13 +184,28 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
           lux: Number(measurement.actual_lux),
         },
       });
+      void projected;
 
       const yearly = yearMapToObject(
         doseByYear([{ start, end }], Number(measurement.actual_lux))
       );
+      const affectedYears = Object.keys(yearly).map(Number);
+
+      await client.query(
+        `UPDATE measurements
+            SET status = 'confirmed', confirmed_by = $1, confirmed_at = now()
+          WHERE id = $2`,
+        [req.sessionUser.userId, id]
+      );
+
+      // 确认生效：仅重算本实测影响到的自然年（实测计入、其计划残余同步替代），
+      // 之后的超额判定/转待复核/预警都以重算后的派生占用为唯一来源。
+      await touchOccupancyYears(client, plan.exhibit_id, affectedYears);
+      const occupancy = await computeOccupancy(client, plan.exhibit_id);
+
       const overflowYears = [];
       const overflows = [];
-      for (const [yearStr, dose] of Object.entries(yearly)) {
+      for (const yearStr of Object.keys(yearly)) {
         const info = occupancy.years[yearStr];
         if (!info || info.limit === null) continue;
         if (info.over) {
@@ -201,12 +219,6 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         }
       }
 
-      await client.query(
-        `UPDATE measurements
-            SET status = 'confirmed', confirmed_by = $1, confirmed_at = now()
-          WHERE id = $2`,
-        [req.sessionUser.userId, id]
-      );
       await recordAudit(client, req.sessionUser, 'measurement.confirm', 'measurement', id, {
         planId: plan.id,
         exhibitId: plan.exhibit_id,
@@ -217,6 +229,7 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
       });
 
       let flagged = [];
+      const flagYears = new Set(overflowYears);
       if (overflowYears.length > 0) {
         flagged = await flagPlansForOverflow(client, req.sessionUser, {
           exhibitId: plan.exhibit_id,
@@ -226,11 +239,18 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
           reason: () =>
             `实测 #${id} 确认后导致 ${overflowYears.join('、')} 年额度超限，转待复核`,
         });
+        // 转待复核撤回这些计划的估算残余：再局部重算相关年份，保证预警读到最终占用。
+        if (flagged.length > 0) {
+          const ys = await affectedYearsForPlans(client, flagged.map((f) => f.id));
+          ys.forEach((y) => flagYears.add(y));
+          await touchOccupancyYears(client, plan.exhibit_id, ys);
+        }
       }
 
       // 实测确认后占用变化（待复核转态也可能影响估算残余）：锁事务内重算分级预警边沿
       const { events: alertEvents } = await alerts.recomputeAlerts(
         client, plan.exhibit_id, {
+          years: [...flagYears],
           actor: req.sessionUser,
           trigger: { type: 'measurement.confirm', detail: { measurementId: id, planId: plan.id } },
         }
@@ -306,9 +326,11 @@ router.post('/:id/correct', requireRole('conservator'), async (req, res, next) =
         [...Object.keys(oldYearly), ...Object.keys(newYearly)].map(Number)
       );
 
-      // 纠错生效后的占用：原记录已置 annulled（不再计量），替代记录为 confirmed。
+      // 纠错生效：旧记录作废（撤回旧贡献）、替代记录确认（计入新贡献）。
+      // 仅局部重算旧、新剂量涉及年份的并集（跨年纠错各年同步），再据重算结果判定超额。
+      await touchOccupancyYears(client, plan.exhibit_id, [...candidateYears]);
       const occupancy = await computeOccupancy(client, plan.exhibit_id);
-      const { overflows, overflowYears } = overflowInfoFromOccupancy(occupancy, candidateYears);
+      const { overflows, overflowYears } = overflowInfoFromOccupancy(occupancy, [...candidateYears]);
 
       await recordAudit(client, req.sessionUser, 'measurement.correct', 'measurement',
         replacement.id, {
@@ -333,6 +355,7 @@ router.post('/:id/correct', requireRole('conservator'), async (req, res, next) =
         });
 
       let flagged = [];
+      const flagYears = new Set(candidateYears);
       if (overflowYears.length > 0) {
         flagged = await flagPlansForOverflow(client, req.sessionUser, {
           exhibitId: plan.exhibit_id,
@@ -342,11 +365,17 @@ router.post('/:id/correct', requireRole('conservator'), async (req, res, next) =
           reason: () =>
             `实测 #${id} 纠错为 #${replacement.id} 后导致 ${overflowYears.join('、')} 年额度超限，转待复核`,
         });
+        if (flagged.length > 0) {
+          const ys = await affectedYearsForPlans(client, flagged.map((f) => f.id));
+          ys.forEach((y) => flagYears.add(y));
+          await touchOccupancyYears(client, plan.exhibit_id, ys);
+        }
       }
 
       // 纠错后占用可能升降：锁事务内重算分级预警边沿（仅向上跨档留事件，下降不补发/不删除）
       const { events: alertEvents } = await alerts.recomputeAlerts(
         client, plan.exhibit_id, {
+          years: [...flagYears],
           actor: req.sessionUser,
           trigger: {
             type: 'measurement.correct',

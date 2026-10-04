@@ -323,6 +323,51 @@ CREATE INDEX IF NOT EXISTS idx_quota_alert_unread ON annual_quota_alerts (exhibi
 ALTER TABLE annual_quota_alerts ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
 ALTER TABLE annual_quota_alerts ADD COLUMN IF NOT EXISTS read_by BIGINT REFERENCES users(id);
 
+-- ---------------------------------------------------------------------------
+-- 年度占用派生结果（统一的“按受影响自然年局部重算”机制）
+-- ---------------------------------------------------------------------------
+-- 所有占用（展品详情/列表、审批与下调试算、账册封存对照、分级预警）都以这两张派生表为
+-- 唯一来源：占用不再在读取时全量扫描历史记录，而是由各业务操作在“原有展品/展厅锁事务内”
+-- 仅重算本次变更影响到的自然年（recomputeOccupancyYears），跨年记录影响到的每个年份都在
+-- 同一年份集合内同步替换。作废/替换（如实测纠错）先整体撤回旧贡献、再计入新贡献——
+-- 实现方式为：在同一事务内删除该展品这些年份的旧派生行、按最新原始记录重算后整批写入，
+-- 因此对外永远看不到“新旧占用混杂”的中间状态；事务失败则全部回滚。
+-- 重建（rebuildOccupancyStore）：一次性按全部原始记录重算所有展品所有年份，单事务提交，
+-- 重建失败即报错回滚，不返回混杂结果；既有数据可随时据此重建派生结果。
+
+-- 每件展品每个自然年一行：该年合计占用（= 已确认实测 + 计划外事故 + 共享照明归属 +
+-- 各已批准/待复核计划估算残余；与原 computeOccupancy 完全同口径、同 round3 舍入）。
+CREATE TABLE IF NOT EXISTS annual_occupancy (
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    year            INTEGER NOT NULL CHECK (year BETWEEN 1900 AND 2999),
+    used_lxh        NUMERIC(12,3) NOT NULL DEFAULT 0,
+    measurement_lxh NUMERIC(12,3) NOT NULL DEFAULT 0,
+    incident_lxh    NUMERIC(12,3) NOT NULL DEFAULT 0,
+    shared_lxh      NUMERIC(12,3) NOT NULL DEFAULT 0,
+    residue_lxh     NUMERIC(12,3) NOT NULL DEFAULT 0,
+    rebuilt_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (exhibit_id, year)
+);
+CREATE INDEX IF NOT EXISTS idx_occupancy_exhibit ON annual_occupancy (exhibit_id, year);
+
+-- 每件展品每个自然年、每条占用来源一行（source_key: measurement/incident/sharedLighting/plan + ':' + id）。
+-- year_dose_lxh 为该来源在该年的剂量；payload_json 为该来源在该年的对外片段（与历史 sources 条目同构，
+-- 读取展品详情时按 source_key 合并各年片段还原完整来源）。占用只增不改的展示字段（时段/照度等）
+-- 同样在重算时按最新原始记录重建；计划状态等非剂量字段以读取时联表为准或随年份重算刷新。
+CREATE TABLE IF NOT EXISTS annual_occupancy_items (
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    year            INTEGER NOT NULL CHECK (year BETWEEN 1900 AND 2999),
+    source_kind     TEXT NOT NULL CHECK (source_kind IN
+                        ('measurement','incident','sharedLighting','plan')),
+    source_id       BIGINT NOT NULL,
+    source_key      TEXT NOT NULL,
+    year_dose_lxh   NUMERIC(12,3) NOT NULL DEFAULT 0,
+    payload_json    JSONB NOT NULL,
+    PRIMARY KEY (exhibit_id, year, source_kind, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_occupancy_items_lookup
+    ON annual_occupancy_items (exhibit_id, source_key);
+
 -- 操作流水（审批、确认、状态变更等全部保留）
 CREATE TABLE IF NOT EXISTS audit_events (
     id              BIGSERIAL PRIMARY KEY,

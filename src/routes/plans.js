@@ -15,6 +15,8 @@ const {
   getOccupyingPlans,
   planWindows,
   computeOccupancy,
+  touchOccupancyYears,
+  affectedYearsForPlans,
   buildOverflows,
   planOverlaps,
   decoratePlans,
@@ -314,10 +316,22 @@ router.post('/batch/approve', requireRole('conservator'), async (req, res, next)
         exhibits: evalResult.exhibits,
       };
 
+      // 联合核准：逐展品仅重算组内计划开灯窗涉及的自然年（跨年计划各年同步；失败整体回滚）。
+      const yearsByExhibit = new Map();
+      for (const exId of exhibitIds) {
+        const groupPlanIds = orderedPlans
+          .filter((p) => Number(p.exhibit_id) === exId)
+          .map((p) => Number(p.id));
+        const ys = await affectedYearsForPlans(client, groupPlanIds);
+        yearsByExhibit.set(exId, ys);
+        await touchOccupancyYears(client, exId, ys);
+      }
+
       // 联合核准后逐展品（已按 id 升序持锁）重算分级预警边沿；整组失败时本事务回滚、事件一并回滚
       const alertEventsByExhibit = [];
       for (const exId of exhibitIds) {
         const { events } = await alerts.recomputeAlerts(client, exId, {
+          years: yearsByExhibit.get(exId),
           actor: req.sessionUser,
           trigger: { type: 'plan.batch_approve', detail: { planIds: ids } },
         });
@@ -441,9 +455,14 @@ async function approve(req, res) {
     await recordAudit(client, req.sessionUser, prevStatus === 'submitted' ? 'plan.approve' : 'plan.reapprove',
       'plan', id, { exhibitId: plan.exhibit_id, addedYearly });
 
+    // 批准/复核通过：仅重算本计划开灯窗涉及的自然年（跨年计划影响各年同步处理）。
+    const affectedYears = await affectedYearsForPlans(client, [id]);
+    await touchOccupancyYears(client, plan.exhibit_id, affectedYears);
+
     // 批准后占用增加：同一展品锁事务内重算分级预警边沿（向上跨档才留事件）
     const { events: alertEvents } = await alerts.recomputeAlerts(
       client, plan.exhibit_id, {
+        years: affectedYears,
         actor: req.sessionUser,
         trigger: {
           type: prevStatus === 'submitted' ? 'plan.approve' : 'plan.reapprove',
@@ -518,8 +537,13 @@ router.post('/:id/cancel', async (req, res, next) => {
         previousStatus: plan.status,
       });
 
+      // 取消：撤回该计划各年估算残余（仅重算其开灯窗年份；submitted 本无残余，重算为空操作）。
+      const affectedYears = await affectedYearsForPlans(client, [id]);
+      await touchOccupancyYears(client, plan.exhibit_id, affectedYears);
+
       // 取消后占用下降：同一展品锁事务内重算预警（回落不写事件，仅刷新最近级别/占用）
       await alerts.recomputeAlerts(client, plan.exhibit_id, {
+        years: affectedYears,
         actor: req.sessionUser,
         trigger: { type: 'plan.cancel', detail: { planId: id, previousStatus: plan.status } },
       });

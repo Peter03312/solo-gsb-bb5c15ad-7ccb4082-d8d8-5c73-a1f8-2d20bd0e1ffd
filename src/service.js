@@ -9,6 +9,13 @@ const {
   nonEmptyString,
 } = require('./validation');
 const { recordAudit } = require('./audit');
+const occupancyStore = require('./occupancy-store');
+const {
+  recomputeOccupancyYears,
+  readOccupancy,
+  projectOccupancy,
+  planWindowYears,
+} = occupancyStore;
 const {
   buildWindows,
   doseByYear,
@@ -847,158 +854,51 @@ function clipIntervalToWindowsForPlan(planWinList, incidentWindows) {
 }
 
 /**
- * 计算一件展品的年度额度占用。
- * 口径：
- *   used[year] = Σ 已确认实测剂量（按时窗自然年拆分）
+ * 计算一件展品的年度额度占用（统一来源：annual_occupancy / annual_occupancy_items 派生表）。
+ *
+ * 派生表由各类业务操作在原有展品/展厅锁事务内通过 recomputeOccupancyYears
+ * 仅按“受影响自然年”局部重算（跨年记录影响的各年同步处理；作废/替换先撤回旧贡献再计入新
+ * 贡献；多展品事务回滚时占用结果一并回滚）。这里只做读取，不再扫描全部历史记录。
+ *
+ * 口径（与历史实现一致，统一 round3 舍入）：
+ *   used[year] = Σ 已确认实测剂量
  *              + Σ 计划外照明事故实际剂量（事故始终按实际照度全额计入实际用光）
+ *              + Σ 共享照明归属实际剂量
  *              + Σ 已批准/待复核计划“未被已确认实测覆盖、扣除本计划停灯、
- *                并扣除与计划窗相交的事故部分”后的估算剂量
- * 同一计划窗口先被该展品全部已确认实测（通常即本计划的实测）、本计划停灯与事故窗内部分
- * 扣除，再按其照度估算；事故窗内部分以事故实际照度计量（替代估算），窗外部分单独计量，
- * 事故不释放计划排期。
+ *                并扣除事故/共享照明窗内相交部分”后的估算剂量。
+ *
+ * 仍支持的试算参数（不写库，只做年份局部几何重算）：
+ *   excludePlanId        把该计划残余从占用中排除（批准/复核/调整核对）；
+ *   extraMeasurement     预演一条尚未确认/即将确认的实测（实测确认前预判）；
+ *   extraMeasurements    预演多条（实测 CSV 批次预览/导入）。
+ * 同时附带展示视图字段（blackouts/incidents/sharedLightings 等），与历史返回结构兼容。
  */
 async function computeOccupancy(client, exhibitId, { excludePlanId = null, extraMeasurement = null, extraMeasurements = null } = {}) {
-  const plans = await getOccupyingPlans(client, exhibitId, excludePlanId);
-  const measurements = await getActiveMeasurements(client, exhibitId);
-  const limitRows = await client.query(
-    'SELECT year, limit_lxh FROM annual_limits WHERE exhibit_id = $1',
-    [exhibitId]
-  );
-  const limits = {};
-  for (const r of limitRows.rows) limits[String(r.year)] = Number(r.limit_lxh);
-
-  const measWindows = measurements.map((m) => ({
-    id: m.id,
-    planId: m.plan_id,
-    start: new Date(m.start_ts).getTime(),
-    end: new Date(m.end_ts).getTime(),
-    lux: Number(m.actual_lux),
-  }));
-  // 预演一条或多条尚未确认（或刚录入）的实测，用于超额预判
-  // （实测批次预览/导入时传入整批行，口径与确认后一致：实测替代估算）
   const extras = [];
   if (extraMeasurement) extras.push(extraMeasurement);
   if (Array.isArray(extraMeasurements)) extras.push(...extraMeasurements);
-  for (const em of extras) {
-    measWindows.push({
-      id: em.id || -1,
-      planId: em.planId,
-      start: em.start,
-      end: em.end,
-      lux: em.lux,
-      draft: true,
-    });
-  }
 
-  // 停灯视图：记录列表（附按年扣减量）+ 按计划分组的“有效扣减窗”（仅占用中的计划计入）
-  const blackoutView = await loadBlackoutView(client, exhibitId, { confirmedRows: measurements });
+  const projected = extras.length > 0 || excludePlanId !== null;
+  const occ = projected
+    ? await projectOccupancy(client, exhibitId, {
+        excludePlanIds: excludePlanId !== null ? [excludePlanId] : [],
+        extraMeasurements: extras,
+      })
+    : await readOccupancy(client, exhibitId);
 
-  // 计划外照明事故视图：逐条实际用光 + 全部事故时间窗（供计划残余扣除窗内相交部分）
+  // 停灯/事故/共享照明展示视图（逐年片段为展示用途，按需从原始记录构造；不参与占用合计，
+  // 合计已统一取自派生表，保证展品详情、审批试算、账册、预警同一来源）。
+  const blackoutView = await loadBlackoutView(client, exhibitId, { confirmedRows: occ.measurements });
   const incidentView = await loadIncidentView(client, exhibitId);
-
-  // 共享照明视图：逐条归属实际用光 + 全部归属窗（与事故同口径：窗内替代估算、窗外单独计量）
   const sharedView = await loadSharedLightingView(client, exhibitId);
 
-  const used = {};
-  const sources = [];
-
-  // 1) 实测部分（停灯不减实测）
-  for (const mw of measWindows) {
-    const yearly = yearMapToObject(doseByYear([{ start: mw.start, end: mw.end }], mw.lux));
-    addYearDose(used, yearly);
-    sources.push({
-      kind: 'measurement',
-      id: mw.id,
-      planId: mw.planId,
-      start: tsToWallString(mw.start),
-      end: tsToWallString(mw.end),
-      lux: mw.lux,
-      yearly,
-    });
-  }
-
-  // 1b) 计划外照明事故：始终按实际照度全额计入实际用光（按自然年拆分）
-  for (const inc of incidentView.items) {
-    addYearDose(used, inc.yearly);
-    sources.push({
-      kind: 'incident',
-      id: inc.id,
-      start: inc.start,
-      end: inc.end,
-      lux: inc.actualLux,
-      reason: inc.reason,
-      yearly: inc.yearly,
-      yearlyInside: inc.yearlyInside,
-      yearlyOutside: inc.yearlyOutside,
-      insidePlanIds: inc.insidePlanIds,
-    });
-  }
-
-  // 1c) 共享照明（规则 19）：按与驻留区间的交集归属本展品的实际用光，始终全额计入
-  for (const sh of sharedView.items) {
-    addYearDose(used, sh.yearly);
-    sources.push({
-      kind: 'sharedLighting',
-      id: sh.id,
-      hallCode: sh.hallCode,
-      start: sh.start,
-      end: sh.end,
-      lux: sh.actualLux,
-      reason: sh.reason,
-      yearly: sh.yearly,
-      yearlyInside: sh.yearlyInside,
-      yearlyOutside: sh.yearlyOutside,
-      insidePlanIds: sh.insidePlanIds,
-      allocations: sh.allocations,
-    });
-  }
-
-  // 2) 计划的估算残余
-  //    （开灯窗 − 已确认实测覆盖 − 本计划停灯 − 事故窗内部分 − 共享照明窗内部分）
-  for (const plan of plans) {
-    const yearly = planResidueYearlyWithShared(
-      plan, measWindows, blackoutView.windowsByPlan,
-      incidentView.windows, sharedView.windows
-    );
-    addYearDose(used, yearly);
-    sources.push({
-      kind: 'plan',
-      id: plan.id,
-      title: plan.title,
-      status: plan.status,
-      startDate: plan.start_date,
-      endDate: plan.end_date,
-      periods: plan.light_periods,
-      lux: Number(plan.estimated_lux),
-      yearly,
-    });
-  }
-
-  const years = {};
-  const allYears = new Set([
-    ...Object.keys(limits),
-    ...Object.keys(used),
-  ].map(Number));
-  for (const year of [...allYears].sort((a, b) => a - b)) {
-    const key = String(year);
-    const usedVal = round3(used[key] || 0);
-    const limitVal = limits[key] !== undefined ? round3(limits[key]) : null;
-    years[key] = {
-      year,
-      limit: limitVal,
-      used: usedVal,
-      remaining: limitVal === null ? null : round3(limitVal - usedVal),
-      over: limitVal === null ? false : usedVal - limitVal > 0.005,
-    };
-  }
-
   return {
-    limits,
-    used,
-    years,
-    sources,
-    plans,
-    measurements,
+    limits: occ.limits,
+    used: occ.used,
+    years: occ.years,
+    sources: occ.sources,
+    plans: occ.plans,
+    measurements: occ.measurements,
     blackouts: blackoutView.items,
     blackoutDeductionYearly: blackoutView.totalDeductionYearly,
     incidents: incidentView.items,
@@ -1006,6 +906,41 @@ async function computeOccupancy(client, exhibitId, { excludePlanId = null, extra
     sharedLightings: sharedView.items,
     sharedLightingWindows: sharedView.windows,
   };
+}
+
+/**
+ * 在调用方已持有的展品/展厅锁事务内，仅重算指定自然年的派生占用（统一局部重算入口）。
+ *  - exhibitIds：单件或多件展品（多展品在同一事务内逐展品处理，失败整体回滚）；
+ *  - years：本次变更影响到的全部自然年（跨年记录取各年并集；作废/替换取旧、新年份并集）。
+ * 同事务删除这些年份的旧派生贡献、按最新原始记录重算写入；不扫描无关年份的历史记录。
+ */
+async function touchOccupancyYears(client, exhibitIds, years) {
+  const ys = (Array.isArray(years) ? years : [years]).filter(Number.isInteger);
+  if (ys.length === 0) return new Map();
+  return recomputeOccupancyYears(client, exhibitIds, ys);
+}
+
+/** 收集一组计划开灯窗涉及的自然年并集（批准/取消/调整等受影响年份）。 */
+async function affectedYearsForPlans(client, planIds) {
+  const years = new Set();
+  for (const pid of [...new Set(planIds.map(Number))]) {
+    const plan = await getPlan(client, pid);
+    for (const y of planWindowYears(plan)) years.add(y);
+  }
+  return [...years].sort((a, b) => a - b);
+}
+
+/**
+ * 一份拟改/虚拟排期（开始日、结束日、每日开灯时段）开灯窗涉及的自然年。
+ * 用于计划调整生效时与“原计划窗年份”求并集：即使某年原残余为 0（被实测完全覆盖），
+ * 排期变化后也可能出现残余，必须纳入局部重算，避免残留旧贡献/漏计新贡献。
+ */
+function scheduleWindowYears(startDate, endDate, periods) {
+  return planWindowYears({
+    start_date: startDate,
+    end_date: endDate,
+    light_periods: Array.isArray(periods) ? JSON.stringify(periods) : periods,
+  });
 }
 
 /** 检查新增/复核的年度剂量并入当前占用后是否超限，返回超额明细数组。 */
@@ -2941,6 +2876,9 @@ module.exports = {
   findOverlappingSharedLightings,
   planResidueYearlyWithShared,
   computeOccupancy,
+  touchOccupancyYears,
+  affectedYearsForPlans,
+  scheduleWindowYears,
   buildOverflows,
   planOverlaps,
   validateMeasurementWindow,

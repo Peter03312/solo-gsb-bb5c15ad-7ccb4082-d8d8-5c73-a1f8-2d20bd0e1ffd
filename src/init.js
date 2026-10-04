@@ -7,6 +7,7 @@ const { pool } = require('./db');
 const config = require('./config');
 const { buildWindows, doseByYear, yearMapToObject } = require('./dosing');
 const { parsePeriods } = require('./validation');
+const store = require('./occupancy-store');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -87,6 +88,10 @@ async function ensureDemo(conservatorId) {
     ]
   );
   console.log('[init] 已写入演示展品与一条已批准跨年计划');
+
+  // 为演示数据建立年度占用派生结果（统一的年度占用来源）。
+  const result = await store.rebuildOccupancyStore();
+  console.log(`[init] 已建立年度占用派生结果（${result.exhibits} 件展品、${result.years} 个展品-年度）`);
 }
 
 async function initializeDatabase() {
@@ -100,6 +105,15 @@ async function initializeDatabase() {
     const custodianRow = await pool.query('SELECT id FROM users WHERE username = $1',
       [config.seed.conservatorUsername]);
     await ensureDemo(custodianRow.rows[0].id);
+  }
+
+  // 既有数据补建：派生占用表为空、但已存在会产生占用的原始数据时（如升级到局部重算机制
+  // 之前的库，或关闭了演示数据写入却有业务数据），单事务全量重建。
+  // 重建失败直接报错退出（initializeDatabase 的失败会阻止服务启动），绝不以空/旧占用对外服务。
+  if (await store.isStoreEmpty(pool) && await store.hasRawOccupancyData(pool)) {
+    console.log('[init] 检测到既有业务数据但年度占用派生结果为空，开始单事务重建...');
+    const result = await store.rebuildOccupancyStore();
+    console.log(`[init] 年度占用派生结果重建完成（${result.exhibits} 件展品、${result.years} 个展品-年度）`);
   }
 }
 

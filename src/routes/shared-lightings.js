@@ -32,6 +32,8 @@ const {
   getOccupyingPlans,
   plansToFlag,
   computeOccupancy,
+  touchOccupancyYears,
+  affectedYearsForPlans,
 } = require('../service');
 const { wallToTs, tsToWallString, doseByYear, yearMapToObject } = require('../dosing');
 const alerts = require('../alerts');
@@ -205,10 +207,14 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
         const alertEventsByExhibit = [];
         const exhibitDetails = [];
         for (const exId of exhibitIds) {
-          const occupancy = await computeOccupancy(client, exId);
           const allocsHere = allocations.filter((a) => a.exhibitId === exId);
           const candidateYears = new Set();
           for (const a of allocsHere) for (const y of Object.keys(a.yearly)) candidateYears.add(Number(y));
+
+          // 归属入账：仅重算本次归属剂量影响到的自然年（各展品各年同步，失败整体回滚）。
+          const affectedYears = [...candidateYears].sort((a, b) => a - b);
+          await touchOccupancyYears(client, exId, affectedYears);
+          const occupancy = await computeOccupancy(client, exId);
 
           const overflows = [];
           const overflowYears = [];
@@ -234,12 +240,14 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
               const reason =
                 `共享照明 #${sessionId}（展厅「${input.hallCode}」，${tsToWallString(input.startMs)} ~ ` +
                 `${tsToWallString(input.endMs)}）登记后导致 ${overflowYears.join('、')} 年额度超限，转待复核`;
-              await client.query(
+              const upd = await client.query(
                 `UPDATE plans
                     SET status = 'pending_review', review_reason = $2, updated_at = now()
-                  WHERE id = $1 AND status = 'approved'`,
+                  WHERE id = $1 AND status = 'approved'
+                  RETURNING id`,
                 [fp.id, reason]
               );
+              if (upd.rows.length === 0) continue;
               await recordAudit(client, req.sessionUser, 'plan.flag_review_shared_lighting',
                 'plan', fp.id, { triggerSharedLightingId: sessionId, overflowYears });
               flaggedPlansByExhibit.push({
@@ -250,11 +258,18 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
                 overflowYears,
               });
             }
+            // 转待复核撤回计划残余：相关年份再次局部重算，预警读到最终占用。
+            const flaggedHere = flaggedPlansByExhibit.filter((f) => f.exhibitId === exId);
+            if (flaggedHere.length > 0) {
+              const ys = await affectedYearsForPlans(client, flaggedHere.map((f) => f.id));
+              await touchOccupancyYears(client, exId, ys);
+            }
           }
 
           // 共享照明归属入账（含可能的待复核转态）后：同一多展品事务内逐展品重算分级预警边沿。
           // 整次登记回滚时，归属/计划状态与预警事件一并回滚。
           const { events: alertEvents } = await alerts.recomputeAlerts(client, exId, {
+            years: affectedYears,
             actor: req.sessionUser,
             trigger: {
               type: 'shared_lighting.create',

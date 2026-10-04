@@ -1305,6 +1305,9 @@ async function runFlow() {
         new Date(dosing.wallToTs('2042-06-01', 720)),
         '联合核准前停灯']
     );
+    // 直接写原始表后，按受影响年份局部重算派生占用（模拟业务接口落库后的统一机制）。
+    await require('../src/occupancy-store').recomputeOccupancyYears(
+      client, exRow.rows[0].exhibit_id, [2042]);
   });
   // 上限 1400：原占用 c2 残余 600 + 组内 c1(2042 部分 800)+bd1(800)+bd2(800)=2400 → 超 1600；
   // 若漏扣停灯（原占用按 800）超额会是 1800
@@ -1607,6 +1610,8 @@ async function runFlow() {
         new Date(dosing2.wallToTs('2035-06-01', 720)),
         'SQL 预置停灯']
     );
+    await require('../src/occupancy-store').recomputeOccupancyYears(
+      client, exRow.rows[0].exhibit_id, [2035]);
   });
   r = await call('GET', `/api/exhibits/${exAdjBk}`, null, 'c');
   const adjBkSrc = r.body.sources.find((s) => s.kind === 'plan' && s.id === abPlan);
@@ -1657,6 +1662,8 @@ async function runFlow() {
         new Date(dosing2.wallToTs('2036-05-01', 660)),
         '预演前停灯']
     );
+    await require('../src/occupancy-store').recomputeOccupancyYears(
+      client, exRow.rows[0].exhibit_id, [2036]);
   });
   r = await call('POST', `/api/exhibits/${exBkLim}/limits/preview`,
     { year: 2036, limitLxh: 700 }, 'c');
@@ -1676,6 +1683,8 @@ async function runFlow() {
         new Date(dosing2.wallToTs('2036-05-01', 840)),
         '预演后停灯']
     );
+    await require('../src/occupancy-store').recomputeOccupancyYears(
+      client, exRow.rows[0].exhibit_id, [2036]);
   });
   r = await call('POST', `/api/exhibits/${exBkLim}/limits/lower`,
     { year: 2036, limitLxh: 700, token: staleBkToken }, 'c');
@@ -1911,6 +1920,8 @@ async function runFlow() {
         new Date(dosing.wallToTs(coYmd, 720)),
         '纠错测试停灯']
     );
+    await require('../src/occupancy-store').recomputeOccupancyYears(
+      client, exRow.rows[0].exhibit_id, [Number(coYmd.slice(0, 4))]);
   });
   r = await call('POST', `/api/measurements/${cm3}/correct`, {
     startDate: coYmd, startTime: '10:30',
@@ -2036,6 +2047,7 @@ async function runFlow() {
         new Date(dosing.wallToTs(`${sealYear}-06-01`, 20 * 60)),
         '封存前停灯']
     );
+    await require('../src/occupancy-store').recomputeOccupancyYears(client, exLd, [sealYear]);
   });
   // 封存前口径：实测 450；P1 残余 (8-3)h*100=500；P2 残余 (4-1)h*100=300；合计 1250
   r = await call('GET', `/api/exhibits/${exLd}`, null, 'i');

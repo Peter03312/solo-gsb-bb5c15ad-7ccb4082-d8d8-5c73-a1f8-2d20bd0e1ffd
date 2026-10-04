@@ -24,6 +24,8 @@ const {
   getOccupyingPlans,
   plansToFlag,
   computeOccupancy,
+  touchOccupancyYears,
+  affectedYearsForPlans,
 } = require('../service');
 const { wallToTs, tsToWallString, doseByYear, yearMapToObject } = require('../dosing');
 const alerts = require('../alerts');
@@ -138,12 +140,16 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
       const row = await registerIncident(client, input, req.sessionUser);
       const incidentId = Number(row.id);
 
-      // 登记后按统一口径重算占用（事故窗内部分已自动替代计划估算，窗外部分单独计量）
-      const occupancy = await computeOccupancy(client, input.exhibitId);
-
       const yearly = yearMapToObject(
         doseByYear([{ start: input.startMs, end: input.endMs }], input.actualLux)
       );
+      const affectedYears = Object.keys(yearly).map(Number);
+
+      // 登记后仅重算事故影响到的自然年（事故全额计入、窗内部分替代计划残余、窗外单独计量）。
+      await touchOccupancyYears(client, input.exhibitId, affectedYears);
+      // 登记后按统一口径重算占用（事故窗内部分已自动替代计划估算，窗外部分单独计量）
+      const occupancy = await computeOccupancy(client, input.exhibitId);
+
       await recordAudit(client, req.sessionUser, 'incident.create', 'lighting_incident', incidentId, {
         exhibitId: input.exhibitId,
         start: tsToWallString(input.startMs),
@@ -172,6 +178,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
 
       // 超额仍生效：相关年度仍有估算残余且尚未开始的已批准计划转待复核
       const flagged = [];
+      const flagYears = new Set(affectedYears);
       if (overflowYears.length > 0) {
         const activePlans = await getOccupyingPlans(client, input.exhibitId);
         const targets = plansToFlag(activePlans, occupancy, overflowYears, Date.now());
@@ -179,12 +186,14 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
           const reason =
             `计划外照明事故 #${incidentId}（${tsToWallString(input.startMs)} ~ ` +
             `${tsToWallString(input.endMs)}）登记后导致 ${overflowYears.join('、')} 年额度超限，转待复核`;
-          await client.query(
+          const upd = await client.query(
             `UPDATE plans
                 SET status = 'pending_review', review_reason = $2, updated_at = now()
-              WHERE id = $1 AND status = 'approved'`,
+              WHERE id = $1 AND status = 'approved'
+              RETURNING id`,
             [fp.id, reason]
           );
+          if (upd.rows.length === 0) continue;
           await recordAudit(client, req.sessionUser, 'plan.flag_review_incident', 'plan', fp.id, {
             triggerIncidentId: incidentId,
             overflowYears,
@@ -196,11 +205,17 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
             overflowYears,
           });
         }
+        if (flagged.length > 0) {
+          const ys = await affectedYearsForPlans(client, flagged.map((f) => f.id));
+          ys.forEach((y) => flagYears.add(y));
+          await touchOccupancyYears(client, input.exhibitId, ys);
+        }
       }
 
       // 事故入账后占用变化（含转待复核对估算残余的影响）：锁事务内重算分级预警边沿
       const { events: alertEvents } = await alerts.recomputeAlerts(
         client, input.exhibitId, {
+          years: [...flagYears],
           actor: req.sessionUser,
           trigger: {
             type: 'incident.create',

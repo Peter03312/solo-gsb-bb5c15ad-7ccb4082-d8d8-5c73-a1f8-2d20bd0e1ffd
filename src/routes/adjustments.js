@@ -16,6 +16,9 @@ const {
   serializeAdjustment,
   planNotStarted,
   dateYmd,
+  touchOccupancyYears,
+  scheduleWindowYears,
+  affectedYearsForPlans,
 } = require('../service');
 const { exhibitDetail } = require('./exhibits');
 const alerts = require('../alerts');
@@ -584,8 +587,26 @@ router.post('/pair/approve', requireRole('conservator'), async (req, res, next) 
         });
       }
 
+      // 成对核准生效：两条计划旧残余同时撤回、新残余同时计入。
+      // 受影响年份取两计划“原窗年份 ∪ 各自拟改窗年份 ∪ 旧/新残余年份”的并集。
+      const pairAffectedSet = new Set();
+      const pairEntries = [{ plan: planA, adj: adjA }, { plan: planB, adj: adjB }];
+      for (const { plan: pPlan, adj: pAdj } of pairEntries) {
+        for (const y of await affectedYearsForPlans(client, [pPlan.id])) pairAffectedSet.add(y);
+        for (const y of scheduleWindowYears(pAdj.start_date, pAdj.end_date, pAdj.light_periods)) {
+          pairAffectedSet.add(y);
+        }
+      }
+      for (const it of evalResult.items) {
+        for (const k of Object.keys(it.oldResidueYearly)) pairAffectedSet.add(Number(k));
+        for (const k of Object.keys(it.newResidueYearly)) pairAffectedSet.add(Number(k));
+      }
+      const pairAffectedYears = [...pairAffectedSet].sort((a, b) => a - b);
+      await touchOccupancyYears(client, exhibitId, pairAffectedYears);
+
       // 成对核准生效后同一展品锁事务内重算分级预警边沿（失败回滚时事件一并回滚）
       const { events: alertEvents } = await alerts.recomputeAlerts(client, exhibitId, {
+        years: pairAffectedYears,
         actor: req.sessionUser,
         trigger: {
           type: 'plan.adjustment.pair_approve',
@@ -704,8 +725,20 @@ router.post('/:id/approve', requireRole('conservator'), async (req, res, next) =
         newResidueYearly: evalResult.newResidueYearly,
       });
 
+      // 调整生效：旧残余撤回、新残余计入。受影响年份取“原计划窗年份 ∪ 拟改窗年份”
+      // （覆盖原残余为 0 而新窗出现残余、或反之的年份；跨年调整各年同步），再并入残余年份并集。
+      const affectedYearSet = new Set([
+        ...(await affectedYearsForPlans(client, [plan.id])),
+        ...scheduleWindowYears(adj.start_date, adj.end_date, adj.light_periods),
+        ...Object.keys(evalResult.oldResidueYearly).map(Number),
+        ...Object.keys(evalResult.newResidueYearly).map(Number),
+      ]);
+      const affectedYears = [...affectedYearSet].sort((a, b) => a - b);
+      await touchOccupancyYears(client, plan.exhibit_id, affectedYears);
+
       // 调整生效后占用可能变化：同一展品锁事务内重算分级预警边沿
       const { events: alertEvents } = await alerts.recomputeAlerts(client, plan.exhibit_id, {
+        years: affectedYears,
         actor: req.sessionUser,
         trigger: {
           type: 'plan.adjustment.approve',

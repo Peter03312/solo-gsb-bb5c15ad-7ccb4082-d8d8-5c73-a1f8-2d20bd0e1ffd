@@ -15,6 +15,8 @@ const {
   getPlan,
   loadBlackoutView,
   registerBlackout,
+  touchOccupancyYears,
+  affectedYearsForPlans,
 } = require('../service');
 const { wallToTs, tsToWallString, yearMapToObject, doseByYear } = require('../dosing');
 const alerts = require('../alerts');
@@ -151,6 +153,11 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
       const yearly = yearMapToObject(
         doseByYear([{ start: input.startMs, end: input.endMs }], Number(plan.estimated_lux))
       );
+
+      // 停灯只从所属计划估算残余扣减：仅重算停灯时段影响到的自然年（即计划窗涉及年份）。
+      const affectedYears = await affectedYearsForPlans(client, [plan.id]);
+      await touchOccupancyYears(client, plan.exhibit_id, affectedYears);
+
       await recordAudit(client, req.sessionUser, 'blackout.create', 'blackout', row.id, {
         planId: plan.id,
         exhibitId: plan.exhibit_id,
@@ -163,6 +170,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
       // 停灯扣减估算后占用下降：锁事务内重算预警（回落不写事件，仅刷新最近级别）
       const { events: alertEvents } = await alerts.recomputeAlerts(
         client, plan.exhibit_id, {
+          years: affectedYears,
           actor: req.sessionUser,
           trigger: { type: 'blackout.create', detail: { blackoutId: Number(row.id), planId: plan.id, yearly } },
         }

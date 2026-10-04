@@ -138,23 +138,29 @@ async function upsertThreshold(client, exhibitId, input, actor) {
 }
 
 /**
- * 在展品锁事务内重算该展品全部已设置阈值年份的预警边沿。
- * 必须在所有业务改动（计划/上限/实测/停灯/事故/共享照明…）写入之后、事务提交之前调用：
- *   - 重新按统一剂量口径计算占用；
+ * 在展品锁事务内重算该展品阈值年份的预警边沿。
+ * 必须在所有业务改动（计划/上限/实测/停灯/事故/共享照明…）与“受影响年份派生占用重算”
+ * （service.touchOccupancyYears）完成之后、事务提交之前调用：
+ *   - 占用统一读自派生表（年度占用的唯一来源），级别口径不变；
  *   - 对每个阈值年份，级别相对“上次记录级别”向上跨越时写事件（跨两级则 low、high 各一条）；
  *   - 同级/回落只更新 last_used_lxh/last_level，不写事件；
  *   - 无上限年份级别恒 none（占用照常记录，待上限登记后的下一次重算才可能向上跨档）。
- * 多展品事务应在按展品 id 升序持有的锁内逐展品调用本函数。
+ * 多展品事务应在按展品 id 升序持有的锁内逐展品调用本函数；options.years 给出本次实际影响
+ * 的自然年时只判定这些年份（其余年份占用未变，跳过且不扫描无关年份），省略则判定全部阈值年。
  *
  * options:
- *   occupancy  已在同事务内算好的占用（避免重复计算）；省略则自行计算；
+ *   occupancy  已在同事务内读好的占用（避免重复读取）；省略则自行读取；
+ *   years      本次受影响自然年（局部重算）；省略表示全部阈值年份；
  *   actor      事件 created_by（触发操作的操作者）；
  *   trigger    { type, detail } 触发来源（写入事件审计快照）。
  * 返回 { events: [对外事件对象…] }（不含已读标记查询）。
  */
-async function recomputeAlerts(client, exhibitId, { occupancy = null, actor = null, trigger = null } = {}) {
+async function recomputeAlerts(client, exhibitId, { occupancy = null, years = null, actor = null, trigger = null } = {}) {
   const occ = occupancy || (await computeOccupancy(client, exhibitId));
-  const rows = await getThresholdRows(client, exhibitId);
+  const thresholdRows = await getThresholdRows(client, exhibitId);
+  const rows = years === null
+    ? thresholdRows
+    : thresholdRows.filter((r) => new Set(years.map(Number)).has(Number(r.year)));
   const created = [];
 
   for (const row of rows) {
