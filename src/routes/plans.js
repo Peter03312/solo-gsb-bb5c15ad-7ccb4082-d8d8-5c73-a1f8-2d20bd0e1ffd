@@ -33,7 +33,7 @@ const {
 } = require('../dosing');
 const { ConflictError, AuthError } = require('../validation');
 const { exhibitDetail } = require('./exhibits');
-const alerts = require('../alerts');
+const { recomputeExhibitUsage } = require('../usage');
 
 const router = express.Router();
 
@@ -314,10 +314,16 @@ router.post('/batch/approve', requireRole('conservator'), async (req, res, next)
         exhibits: evalResult.exhibits,
       };
 
-      // 联合核准后逐展品（已按 id 升序持锁）重算分级预警边沿；整组失败时本事务回滚、事件一并回滚
+      // 联合核准后逐展品（已按 id 升序持锁）只重算本展品组内计划残余影响到的年份；
+      // 整组失败时本事务回滚、派生占用与预警事件一并回滚。
       const alertEventsByExhibit = [];
       for (const exId of exhibitIds) {
-        const { events } = await alerts.recomputeAlerts(client, exId, {
+        const affectedYears = new Set();
+        for (const it of evalResult.items) {
+          if (Number(it.exhibitId) !== Number(exId)) continue;
+          for (const y of Object.keys(it.residueYearly || {})) affectedYears.add(Number(y));
+        }
+        const { events } = await recomputeExhibitUsage(client, exId, [...affectedYears], {
           actor: req.sessionUser,
           trigger: { type: 'plan.batch_approve', detail: { planIds: ids } },
         });
@@ -441,16 +447,18 @@ async function approve(req, res) {
     await recordAudit(client, req.sessionUser, prevStatus === 'submitted' ? 'plan.approve' : 'plan.reapprove',
       'plan', id, { exhibitId: plan.exhibit_id, addedYearly });
 
-    // 批准后占用增加：同一展品锁事务内重算分级预警边沿（向上跨档才留事件）
-    const { events: alertEvents } = await alerts.recomputeAlerts(
-      client, plan.exhibit_id, {
+    // 批准后占用增加：同一展品锁事务内只重算本计划影响到的自然年（跨年计划为年份并集），
+    // 派生占用与分级预警边沿在同一事务内更新，失败一并回滚。
+    const affectedYears = Object.keys(addedYearly).map(Number);
+    const alertEvents = (await recomputeExhibitUsage(
+      client, plan.exhibit_id, affectedYears, {
         actor: req.sessionUser,
         trigger: {
           type: prevStatus === 'submitted' ? 'plan.approve' : 'plan.reapprove',
           detail: { planId: id, addedYearly },
         },
       }
-    );
+    )).events;
 
     return { ...(await exhibitDetail(client, plan.exhibit_id, { lock: true })), quotaAlertEvents: alertEvents };
   });
@@ -518,8 +526,11 @@ router.post('/:id/cancel', async (req, res, next) => {
         previousStatus: plan.status,
       });
 
-      // 取消后占用下降：同一展品锁事务内重算预警（回落不写事件，仅刷新最近级别/占用）
-      await alerts.recomputeAlerts(client, plan.exhibit_id, {
+      // 取消后占用下降：同一展品锁事务内仅重算该计划开灯窗涉及的年份
+      // （回落不写预警事件，仅刷新最近级别/占用与派生占用行）。
+      const { yearsOfIntervals } = require('../service');
+      const affectedYears = [...yearsOfIntervals(planWindows(plan))];
+      await recomputeExhibitUsage(client, plan.exhibit_id, affectedYears, {
         actor: req.sessionUser,
         trigger: { type: 'plan.cancel', detail: { planId: id, previousStatus: plan.status } },
       });

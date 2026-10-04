@@ -23,7 +23,7 @@ const {
 } = require('../service');
 const { doseByYear, yearMapToObject, tsToWallString } = require('../dosing');
 const { exhibitDetail, serializeMeasurement } = require('./exhibits');
-const alerts = require('../alerts');
+const { recomputeExhibitUsage } = require('../usage');
 
 const router = express.Router();
 
@@ -228,13 +228,17 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         });
       }
 
-      // 实测确认后占用变化（待复核转态也可能影响估算残余）：锁事务内重算分级预警边沿
-      const { events: alertEvents } = await alerts.recomputeAlerts(
-        client, plan.exhibit_id, {
+      // 实测确认（含可能的待复核转态）完成后：锁事务内仅重算本次剂量影响到的自然年。
+      // 先刷新派生占用，再以最终占用判定分级预警边沿，二者与业务写入同事务提交/回滚。
+      const affectedYears = Object.keys(yearly).map(Number);
+      const { refreshUsageYears, recomputeExhibitUsage } = require('../usage');
+      await refreshUsageYears(client, plan.exhibit_id, affectedYears);
+      const alertEvents = (await recomputeExhibitUsage(
+        client, plan.exhibit_id, affectedYears, {
           actor: req.sessionUser,
           trigger: { type: 'measurement.confirm', detail: { measurementId: id, planId: plan.id } },
         }
-      );
+      )).events;
 
       const detail = await exhibitDetail(client, plan.exhibit_id, { lock: true });
       return { detail, overflows, overflowYears, flagged, alertEvents };
@@ -344,16 +348,20 @@ router.post('/:id/correct', requireRole('conservator'), async (req, res, next) =
         });
       }
 
-      // 纠错后占用可能升降：锁事务内重算分级预警边沿（仅向上跨档留事件，下降不补发/不删除）
-      const { events: alertEvents } = await alerts.recomputeAlerts(
-        client, plan.exhibit_id, {
+      // 纠错后占用可能升降：锁事务内对“旧/新剂量涉及年份并集”局部重算（先撤旧贡献再计新贡献）。
+      // 先刷新派生占用，再以最终占用判定这些年份的预警边沿（仅向上跨档留事件，下降不补发/不删除）。
+      const affectedYears = [...candidateYears];
+      const { refreshUsageYears } = require('../usage');
+      await refreshUsageYears(client, plan.exhibit_id, affectedYears);
+      const alertEvents = (await recomputeExhibitUsage(
+        client, plan.exhibit_id, affectedYears, {
           actor: req.sessionUser,
           trigger: {
             type: 'measurement.correct',
             detail: { originalMeasurementId: id, replacementMeasurementId: replacement.id, planId: plan.id },
           },
         }
-      );
+      )).events;
 
       const detail = await exhibitDetail(client, plan.exhibit_id, { lock: true });
       const correction = {

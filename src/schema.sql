@@ -323,6 +323,27 @@ CREATE INDEX IF NOT EXISTS idx_quota_alert_unread ON annual_quota_alerts (exhibi
 ALTER TABLE annual_quota_alerts ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
 ALTER TABLE annual_quota_alerts ADD COLUMN IF NOT EXISTS read_by BIGINT REFERENCES users(id);
 
+-- 按自然年局部重算的派生占用表（annual_usage）：
+-- 每行是一件展品某个自然年“按统一剂量口径重算后的当前占用”，全部数字由源数据派生：
+--   used_lxh       = 已确认实测 + 计划外照明事故 + 共享照明归属 + 各占用计划估算残余
+--   confirmed_lxh / incident_lxh / shared_lxh_lxh / residue_lxh 为各组成部分（供核对/预警）。
+-- 所有会改变占用或上限的操作都在原有展品/展厅锁事务内、只重算“本次变更受影响的自然年”，
+-- 跨年记录影响到的每个年份各自重算；作废/替换先撤旧贡献再计新贡献（年份并集全量重算）。
+-- 单次变更不扫描无关年份的历史记录；派生结果可由 scripts/rebuild-usage.js 全量重建。
+-- 重算与业务写入同事务提交或回滚，读取方不会看到新旧占用混杂的状态。
+CREATE TABLE IF NOT EXISTS annual_usage (
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    year            INTEGER NOT NULL CHECK (year BETWEEN 1900 AND 2999),
+    used_lxh        NUMERIC(12,3) NOT NULL DEFAULT 0,
+    confirmed_lxh   NUMERIC(12,3) NOT NULL DEFAULT 0,
+    incident_lxh    NUMERIC(12,3) NOT NULL DEFAULT 0,
+    shared_lxh      NUMERIC(12,3) NOT NULL DEFAULT 0,
+    residue_lxh     NUMERIC(12,3) NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (exhibit_id, year)
+);
+CREATE INDEX IF NOT EXISTS idx_annual_usage_exhibit ON annual_usage (exhibit_id, year);
+
 -- 操作流水（审批、确认、状态变更等全部保留）
 CREATE TABLE IF NOT EXISTS audit_events (
     id              BIGSERIAL PRIMARY KEY,

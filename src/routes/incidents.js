@@ -26,7 +26,6 @@ const {
   computeOccupancy,
 } = require('../service');
 const { wallToTs, tsToWallString, doseByYear, yearMapToObject } = require('../dosing');
-const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -198,16 +197,20 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
         }
       }
 
-      // 事故入账后占用变化（含转待复核对估算残余的影响）：锁事务内重算分级预警边沿
-      const { events: alertEvents } = await alerts.recomputeAlerts(
-        client, input.exhibitId, {
+      // 事故入账后占用变化（含转待复核对估算残余的影响）：锁事务内仅重算事故剂量
+      // 影响到的自然年（跨年事故各年同步）。先刷新派生占用，再以最终占用判定预警边沿。
+      const { refreshUsageYears, recomputeExhibitUsage } = require('../usage');
+      const affectedYears = Object.keys(yearly).map(Number);
+      await refreshUsageYears(client, input.exhibitId, affectedYears);
+      const alertEvents = (await recomputeExhibitUsage(
+        client, input.exhibitId, affectedYears, {
           actor: req.sessionUser,
           trigger: {
             type: 'incident.create',
             detail: { incidentId, yearly },
           },
         }
-      );
+      )).events;
 
       const { exhibitDetail } = require('./exhibits');
       const detailAfter = await exhibitDetail(client, input.exhibitId, { lock: true });

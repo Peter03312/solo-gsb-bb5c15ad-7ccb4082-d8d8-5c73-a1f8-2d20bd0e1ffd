@@ -9,6 +9,7 @@ RUN npm install --omit=dev
 # 复制应用代码
 COPY src ./src
 COPY public ./public
+COPY scripts ./scripts
 
 ENV NODE_ENV=production
 EXPOSE 3000

@@ -27,7 +27,6 @@ const {
 } = require('../service');
 const { round3 } = require('../dosing');
 const { parseMeasurementCsvRows } = require('../csv');
-const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -466,16 +465,20 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         });
       }
 
-      // 批次确认入账（含可能的待复核转态）后：锁事务内重算分级预警边沿
-      const { events: alertEvents } = await alerts.recomputeAlerts(
-        client, exhibitId, {
+      // 批次确认入账（含可能的待复核转态）后：锁事务内仅重算整批剂量影响到的年份。
+      // 先刷新派生占用，再以最终占用判定这些年份的预警边沿。
+      const { refreshUsageYears, recomputeExhibitUsage } = require('../usage');
+      const affectedYears = Object.keys(totalYearly).map(Number);
+      await refreshUsageYears(client, exhibitId, affectedYears);
+      const alertEvents = (await recomputeExhibitUsage(
+        client, exhibitId, affectedYears, {
           actor: req.sessionUser,
           trigger: {
             type: 'measurement_batch.confirm',
             detail: { batchId: id, measurementIds, totalYearly },
           },
         }
-      );
+      )).events;
 
       const confirmResult = {
         rowCount: evaluated.length,

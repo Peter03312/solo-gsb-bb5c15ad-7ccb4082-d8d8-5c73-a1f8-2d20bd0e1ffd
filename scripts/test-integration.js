@@ -3319,6 +3319,228 @@ async function runFlow() {
     assert(card && card.quotaAlertsConfigured >= 1 && card.quotaAlertHigh >= 1,
       '展品列表附加分级预警当前级别计数');
   }
+
+  // =======================================================================
+  // 年度占用按受影响自然年局部重算（annual_usage 派生表 + 统一口径 + 回滚 + 重建）
+  // =======================================================================
+  {
+    const q = async (text, params = []) => (await dbModule.pool.query(text, params)).rows;
+    const wallYear = Number(dosing.tsToWall(Date.now()).ymd.slice(0, 4));
+    const exU = await createExhibit('占用局部重算展品');
+    let rr;
+
+    const usageYears = () => q('SELECT year, used_lxh, confirmed_lxh, incident_lxh, shared_lxh, residue_lxh FROM annual_usage WHERE exhibit_id = $1 ORDER BY year', [exU]);
+
+    // 登记上限后该年存在占用为 0 的派生行（无上限的年份不会被局部重算覆盖）
+    await call('POST', `/api/exhibits/${exU}/limits`, { year: 2025, limitLxh: 10000 }, 'c');
+    await call('POST', `/api/exhibits/${exU}/limits`, { year: 2026, limitLxh: 10000 }, 'c');
+    let rows = await usageYears();
+    assert(rows.length === 2 && rows.every((r) => Number(r.used_lxh) === 0),
+      `登记上限年份占用为 0 的派生行：${JSON.stringify(rows)}`);
+
+    // 批准跨年计划 2025-12-31 ~ 2026-01-01 每天 09:00-17:00，100lx：每年 800
+    const crossPlan = await submitPlan(exU, '跨年占用计划', '2025-12-31', '2026-01-01',
+      ['09:00-17:00'], 100);
+    rr = await call('POST', `/api/plans/${crossPlan}/approve`, {}, 'c');
+    assert(rr.status === 200, '批准跨年计划');
+    rows = await usageYears();
+    assert(rows.length === 2 && rows[0].year === 2025 && Number(rows[0].used_lxh) === 800
+      && Number(rows[0].residue_lxh) === 800
+      && rows[1].year === 2026 && Number(rows[1].used_lxh) === 800
+      && Number(rows[1].residue_lxh) === 800,
+      `跨年计划一次在两年各写派生占用 800：${JSON.stringify(rows)}`);
+
+    // 展品详情（按当前数据重算）与派生行同口径
+    rr = await call('GET', `/api/exhibits/${exU}`, null, 'i');
+    assert(rr.body.years['2025'].used === 800 && rr.body.years['2026'].used === 800,
+      '展品详情年度占用与派生行一致');
+
+    // 展品列表的年度概况同样取自派生表（不全量重算）
+    rr = await call('GET', '/api/exhibits', null, 'i');
+    const uCard = rr.body.exhibits.find((e) => e.id === exU);
+    assert(uCard.years['2025'].used === 800 && uCard.years['2026'].used === 800,
+      '展品列表年度概况与派生行一致');
+
+    // 取消计划：两年派生占用同步撤回（跨年记录影响的各年同步处理；上限年份保留 0 行）
+    rr = await call('POST', `/api/plans/${crossPlan}/cancel`, {}, 'c');
+    assert(rr.status === 200, '取消跨年计划');
+    rows = await usageYears();
+    assert(rows.length === 2 && rows.every((r) => Number(r.used_lxh) === 0),
+      '取消后两年派生占用撤回（仅余上限年份的 0 行）');
+
+    // ---- 实测确认：已确认实测部分 + 计划残余部分分列；先撤旧（无）再计新 ----
+    const pA = await submitPlan(exU, '实测计划', `${wallYear}-05-01`, `${wallYear}-05-01`,
+      ['09:00-17:00'], 100); // 800
+    await call('POST', `/api/exhibits/${exU}/limits`, { year: wallYear, limitLxh: 10000 }, 'c');
+    await call('POST', `/api/plans/${pA}/approve`, {}, 'c');
+    rr = await call('POST', '/api/measurements', {
+      planId: pA, startDate: `${wallYear}-05-01`, startTime: '09:00',
+      endDate: `${wallYear}-05-01`, endTime: '13:00', actualLux: 200,
+    }, 'c'); // 4h*200 = 800 实测，替代 400 估算；剩余估算 400
+    const measId = rr.body.measurement.id;
+    rr = await call('POST', `/api/measurements/${measId}/confirm`, {}, 'c');
+    assert(rr.status === 200, '确认实测');
+    rows = await usageYears();
+    const cur = rows.find((r) => r.year === wallYear);
+    assert(cur && Number(cur.confirmed_lxh) === 800 && Number(cur.residue_lxh) === 400
+      && Number(cur.used_lxh) === 1200,
+      `派生行分列实测 800 / 残余 400 / 合计 1200：${JSON.stringify(cur)}`);
+
+    // ---- 实测纠错：撤回旧贡献再计入新贡献（旧/新年份并集；这里同年份剂量变化）----
+    rr = await call('POST', `/api/measurements/${measId}/correct`, {
+      startDate: `${wallYear}-05-01`, startTime: '09:00',
+      endDate: `${wallYear}-05-01`, endTime: '12:00', actualLux: 100,
+      reason: '时段照度录错，重算测试',
+    }, 'c'); // 3h*100=300 实测；剩余估算 500
+    assert(rr.status === 200, '实测纠错生效');
+    rows = await usageYears();
+    const fixed = rows.find((r) => r.year === wallYear);
+    assert(fixed && Number(fixed.confirmed_lxh) === 300 && Number(fixed.residue_lxh) === 500
+      && Number(fixed.used_lxh) === 800,
+      `纠错后旧贡献撤回、新贡献计入：实测 300 / 残余 500 / 合计 800：${JSON.stringify(fixed)}`);
+
+    // ---- 停灯：只扣计划估算残余（当年）----
+    const pB = await submitPlan(exU, '停灯计划', `${wallYear}-06-01`, `${wallYear}-06-01`,
+      ['09:00-17:00'], 100); // 800
+    rr = await call('POST', `/api/plans/${pB}/approve`, {}, 'c');
+    assert(rr.status === 200, '批准停灯计划');
+    rr = await call('POST', '/api/blackouts', {
+      planId: pB, startDate: `${wallYear}-06-01`, startTime: '10:00',
+      endDate: `${wallYear}-06-01`, endTime: '12:00', reason: '检修',
+    }, 'c'); // 扣 2h*100=200
+    assert(rr.status === 201, '登记停灯');
+    rows = await usageYears();
+    const afterBlackout = rows.find((r) => r.year === wallYear);
+    // 该年：纠错后实测 300 + pA 残余 500 + pB 残余 600 = 1400
+    assert(afterBlackout && Number(afterBlackout.used_lxh) === 1400
+      && Number(afterBlackout.residue_lxh) === 1100,
+      `停灯只扣估算残余：合计 1400 / 残余 1100：${JSON.stringify(afterBlackout)}`);
+
+    // ---- 计划外事故：incident 部分全额计入，窗内部分替代计划残余 ----
+    const pC = await submitPlan(exU, '事故计划', `${wallYear}-07-01`, `${wallYear}-07-01`,
+      ['09:00-17:00'], 100); // 800
+    await call('POST', `/api/plans/${pC}/approve`, {}, 'c');
+    rr = await call('POST', '/api/incidents', {
+      exhibitId: exU, startDate: `${wallYear}-07-01`, startTime: '09:00',
+      endDate: `${wallYear}-07-01`, endTime: '13:00', actualLux: 150, reason: '未关灯',
+    }, 'c'); // 4h*150=600 事故；窗内替代 pC 估算 400，pC 残余剩 400
+    assert(rr.status === 201 || rr.status === 409, '事故入账（超限仍可能 409 生效）');
+    rows = await usageYears();
+    const afterIncident = rows.find((r) => r.year === wallYear);
+    // 该年：实测 300 + 事故 600 + 残余(pA 500 + pB 600 + pC 400)=1500 => 2400
+    assert(afterIncident && Number(afterIncident.confirmed_lxh) === 300
+      && Number(afterIncident.incident_lxh) === 600
+      && Number(afterIncident.residue_lxh) === 1500
+      && Number(afterIncident.used_lxh) === 2400,
+      `事故全额计入且窗内替代残余：${JSON.stringify(afterIncident)}`);
+
+    // ---- 调整计划：旧残余撤回、新残余计入（年份并集；用未来未开始计划）----
+    const adjFuture = new Date(Date.now() + 60 * 86400000);
+    const adjYmd = `${adjFuture.getUTCFullYear()}-` +
+      `${String(adjFuture.getUTCMonth() + 1).padStart(2, '0')}-` +
+      `${String(adjFuture.getUTCDate()).padStart(2, '0')}`;
+    const adjNext = new Date(adjFuture.getTime() + 86400000);
+    const adjNextYmd = `${adjNext.getUTCFullYear()}-` +
+      `${String(adjNext.getUTCMonth() + 1).padStart(2, '0')}-` +
+      `${String(adjNext.getUTCDate()).padStart(2, '0')}`;
+    const pD = await submitPlan(exU, '待调整计划', adjYmd, adjYmd,
+      ['09:00-17:00'], 100); // 800
+    await call('POST', `/api/plans/${pD}/approve`, {}, 'c');
+    const usedBeforeAdj = Number((await usageYears()).find((r) => r.year === wallYear)
+      ? (await usageYears()).find((r) => r.year === wallYear).used_lxh : 0);
+    rr = await call('POST', '/api/adjustments', {
+      planId: pD, startDate: adjNextYmd, endDate: adjNextYmd,
+      periods: ['09:00-12:00'], estimatedLux: 100,
+    }, 'i');
+    const adjId = rr.body.adjustment.id;
+    assert(rr.status === 201 || rr.status === 200,
+      `提交调整申请：${rr.status} ${JSON.stringify(rr.body)}`);
+    rr = await call('POST', `/api/adjustments/${adjId}/approve`, {}, 'c');
+    assert(rr.status === 200, `批准调整申请：${rr.status} ${JSON.stringify(rr.body)}`);
+    rows = await usageYears();
+    const afterAdj = rows.find((r) => r.year === wallYear);
+    // pD 残余由 800 变为 300（若拟改日落入下一年，则该年减少 800、次年新增 300）
+    const adjYear = Number(adjNextYmd.slice(0, 4));
+    if (adjYear === wallYear) {
+      assert(afterAdj && Number(afterAdj.used_lxh) === usedBeforeAdj - 500,
+        `调整同年份：旧残余 800 撤回、新残余 300 计入：${JSON.stringify(afterAdj)}`);
+    } else {
+      assert(afterAdj && Number(afterAdj.used_lxh) === usedBeforeAdj - 800,
+        `调整跨年：旧年份撤回 800：${JSON.stringify(afterAdj)}`);
+      const nextRow = (await usageYears()).find((r) => r.year === adjYear);
+      assert(nextRow && Number(nextRow.residue_lxh) >= 300 - 0.005,
+        `调整跨年：新年份计入新残余 300：${JSON.stringify(nextRow)}`);
+    }
+
+    // ---- 上限变更只重算该年（这里验证不抛错且占用值不变）----
+    const usedAtLimitYear = Number((await usageYears()).find((r) => r.year === wallYear).used_lxh);
+    rr = await call('POST', `/api/exhibits/${exU}/limits`, { year: wallYear, limitLxh: 5000 }, 'c');
+    assert(rr.status === 200, '调整上限');
+    rows = await usageYears();
+    assert(Number(rows.find((r) => r.year === wallYear).used_lxh) === usedAtLimitYear,
+      '上限变更不改变占用派生值');
+
+    // ---- 失败回滚：超限批准被拒时，派生占用与预警事件均不变 ----
+    const usedBefore = Number((await usageYears()).find((r) => r.year === wallYear).used_lxh);
+    const bad = await submitPlan(exU, '必然超限', `${wallYear}-10-01`, `${wallYear}-10-15`,
+      ['09:00-17:00'], 500); // 15*8*500=60000
+    rr = await call('POST', `/api/plans/${bad}/approve`, {}, 'c');
+    assert(rr.status === 409, '超限批准 409');
+    const usedAfter = Number((await usageYears()).find((r) => r.year === wallYear).used_lxh);
+    assert(usedBefore === usedAfter, '被回滚的批准不改变派生占用');
+
+    // ---- 全量重建：删除派生行后执行重建脚本的核心逻辑，结果与当前重算一致 ----
+    await dbModule.pool.query('DELETE FROM annual_usage WHERE exhibit_id = $1', [exU]);
+    assert((await usageYears()).length === 0, '删除派生行');
+    const usageModule = require('../src/usage');
+    const rebuildYears = await usageModule.yearsForRebuild({
+      query: (text, params) => dbModule.pool.query(text, params),
+    }, exU).catch(() => null);
+    void rebuildYears;
+    // 在事务内直接复用重建函数（与 scripts/rebuild-usage.js 同一路径）
+    await dbModule.withTransaction(async (client) => {
+      const svc = require('../src/service');
+      const yrs = await usageModule.yearsForRebuild(client, exU);
+      await client.query('DELETE FROM annual_usage WHERE exhibit_id = $1', [exU]);
+      for (let i = 0; i < yrs.length; i += 40) {
+        await usageModule.refreshUsageYears(client, exU, yrs.slice(i, i + 40));
+      }
+      // 重建后逐年与 computeOccupancy 当前值核对
+      const occ = await svc.computeOccupancy(client, exU);
+      const rebuilt = await client.query(
+        'SELECT year, used_lxh FROM annual_usage WHERE exhibit_id = $1', [exU]);
+      for (const row of rebuilt.rows) {
+        assert(Math.abs(Number(row.used_lxh) - Number(occ.years[String(row.year)].used)) < 0.005,
+          `重建值与当前重算一致（${row.year} 年）`);
+      }
+      // 所有有占用的年份都已重建
+      for (const key of Object.keys(occ.used)) {
+        if (Number(occ.used[key]) === 0) continue;
+        assert(rebuilt.rows.some((r) => Number(r.year) === Number(key)),
+          `重建覆盖占用年份 ${key}`);
+      }
+    });
+
+    // ---- HTTP 维护接口重建（保管员）：清空后调用接口，派生结果恢复且与详情一致 ----
+    await dbModule.pool.query('DELETE FROM annual_usage');
+    rr = await call('POST', '/api/maintenance/rebuild-usage', {}, 'i');
+    assert(rr.status === 403, '布展员不能重建占用');
+    rr = await call('POST', '/api/maintenance/rebuild-usage', {}, 'c');
+    assert(rr.status === 200 && rr.body.ok && rr.body.exhibitCount >= 1,
+      `保管员全量重建成功：${rr.status} ${JSON.stringify(rr.body).slice(0, 200)}`);
+    const afterHttp = await call('GET', `/api/exhibits/${exU}`, null, 'i');
+    for (const key of Object.keys(afterHttp.body.years)) {
+      const live = afterHttp.body.years[key].used;
+      const row = (await usageYears()).find((r) => r.year === Number(key));
+      assert(row && Math.abs(Number(row.used_lxh) - live) < 0.005,
+        `HTTP 重建后 ${key} 年派生占用与详情一致`);
+    }
+    // 指定展品 + 未知展品 400
+    rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [999999] }, 'c');
+    assert(rr.status === 400, '重建未知展品返回 400');
+    rr = await call('POST', '/api/maintenance/rebuild-usage', { exhibitIds: [exU] }, 'c');
+    assert(rr.status === 200 && rr.body.exhibitCount === 1, '按展品重建');
+  }
 }
 
 main().catch((err) => {

@@ -3,10 +3,11 @@
 const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
-const { pool } = require('./db');
+const { pool, withTransaction } = require('./db');
 const config = require('./config');
 const { buildWindows, doseByYear, yearMapToObject } = require('./dosing');
 const { parsePeriods } = require('./validation');
+const { rebuildExhibitUsage } = require('./usage');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -89,6 +90,28 @@ async function ensureDemo(conservatorId) {
   console.log('[init] 已写入演示展品与一条已批准跨年计划');
 }
 
+/**
+ * 启动时补齐派生占用表 annual_usage：
+ *  - 全新空库：无展品，直接跳过；
+ *  - 全新带演示数据 / 从旧版本升级（annual_usage 尚无行但已有展品/上限/计划等源数据）：
+ *    逐展品在事务内按统一剂量口径全量重建一次，任一年份不一致即抛错中止启动，
+ *    绝不带着新旧占用混杂的派生结果对外服务。
+ * 已在运行中维护的库（annual_usage 非空）不在启动时重复扫描全部历史。
+ */
+async function backfillDerivedUsage() {
+  const { rows: usedRows } = await pool.query('SELECT COUNT(*)::int AS n FROM annual_usage');
+  if (Number(usedRows[0].n) > 0) return;
+  const { rows: exhibitRows } = await pool.query('SELECT id FROM exhibits ORDER BY id');
+  if (exhibitRows.length === 0) return;
+
+  console.log(`[init] annual_usage 为空，开始从既有数据重建 ${exhibitRows.length} 件展品的年度占用…`);
+  for (const r of exhibitRows) {
+    const exhibitId = Number(r.id);
+    await withTransaction((client) => rebuildExhibitUsage(client, exhibitId));
+  }
+  console.log('[init] annual_usage 重建完成');
+}
+
 async function initializeDatabase() {
   await waitForDatabase();
   await ensureSchema();
@@ -101,6 +124,8 @@ async function initializeDatabase() {
       [config.seed.conservatorUsername]);
     await ensureDemo(custodianRow.rows[0].id);
   }
+  // 派生结果补齐（新库演示数据 / 旧库升级首启）：失败则启动中止，避免对外提供混杂占用。
+  await backfillDerivedUsage();
 }
 
-module.exports = { initializeDatabase };
+module.exports = { initializeDatabase, backfillDerivedUsage };

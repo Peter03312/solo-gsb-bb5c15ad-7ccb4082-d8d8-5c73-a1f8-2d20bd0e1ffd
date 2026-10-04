@@ -16,6 +16,7 @@ const {
   buildYearSnapshot,
 } = require('../ledger');
 const alerts = require('../alerts');
+const { recomputeExhibitUsage } = require('../usage');
 
 const router = express.Router();
 
@@ -245,13 +246,65 @@ async function applyLowerAndFlag(client, actor, exhibitId, year, previousLimit, 
 }
 
 // 展品列表（带每展品年度额度概况 + 分级预警当前级别计数，仅附加字段）
+// 年度概况直接读取派生占用表 annual_usage（与详情同一口径，由各变更事务按年局部维护），
+// 不为列表逐展品重算全部历史。
 router.get('/', async (req, res, next) => {
   try {
     const { rows } = await query('SELECT * FROM exhibits ORDER BY id');
+    const ids = rows.map((e) => e.id);
+    const usageByExhibit = new Map();
+    const limitsByExhibit = new Map();
+    const thresholdsByExhibit = new Map();
+    if (ids.length > 0) {
+      const ph = ids.map((_, i) => `$${i + 1}`).join(',');
+      const usageRows = await query(
+        `SELECT * FROM annual_usage WHERE exhibit_id IN (${ph}) ORDER BY exhibit_id, year`, ids);
+      for (const u of usageRows.rows) {
+        const exId = Number(u.exhibit_id);
+        if (!usageByExhibit.has(exId)) usageByExhibit.set(exId, {});
+        usageByExhibit.get(exId)[String(u.year)] = u;
+      }
+      const limitRows = await query(
+        `SELECT exhibit_id, year, limit_lxh FROM annual_limits WHERE exhibit_id IN (${ph})`, ids);
+      for (const l of limitRows.rows) {
+        const exId = Number(l.exhibit_id);
+        if (!limitsByExhibit.has(exId)) limitsByExhibit.set(exId, {});
+        limitsByExhibit.get(exId)[String(l.year)] = Number(l.limit_lxh);
+      }
+      const thresholdRows = await query(
+        `SELECT * FROM annual_quota_thresholds WHERE exhibit_id IN (${ph}) ORDER BY exhibit_id, year`,
+        ids);
+      for (const t of thresholdRows.rows) {
+        const exId = Number(t.exhibit_id);
+        if (!thresholdsByExhibit.has(exId)) thresholdsByExhibit.set(exId, []);
+        thresholdsByExhibit.get(exId).push(t);
+      }
+    }
+
     const items = [];
     for (const e of rows) {
-      const occupancy = await computeOccupancy({ query }, e.id);
-      const thresholds = await alerts.buildThresholdView({ query }, e.id, occupancy);
+      const usageByYear = usageByExhibit.get(e.id) || {};
+      const limitsByYear = limitsByExhibit.get(e.id) || {};
+      const years = {};
+      const yearKeys = new Set(
+        [...Object.keys(usageByYear), ...Object.keys(limitsByYear)].map(Number)
+      );
+      for (const year of [...yearKeys].sort((a, b) => a - b)) {
+        const key = String(year);
+        const usedVal = usageByYear[key] ? Number(usageByYear[key].used_lxh) : 0;
+        const limitVal = limitsByYear[key] !== undefined ? Number(limitsByYear[key]) : null;
+        years[key] = {
+          year,
+          limit: limitVal,
+          used: usedVal,
+          remaining: limitVal === null ? null : Math.round((limitVal - usedVal) * 1000) / 1000,
+          over: limitVal === null ? false : usedVal - limitVal > 0.005,
+        };
+      }
+      const thresholds = alerts.buildThresholdViewFromUsage(
+        thresholdsByExhibit.get(e.id) || [],
+        { usageByYear, limitsByYear }
+      );
       let quotaAlertHigh = 0;
       let quotaAlertLow = 0;
       for (const t of thresholds) {
@@ -260,7 +313,7 @@ router.get('/', async (req, res, next) => {
       }
       items.push({
         ...e,
-        years: occupancy.years,
+        years,
         quotaAlertsConfigured: thresholds.length,
         quotaAlertHigh,
         quotaAlertLow,
@@ -409,12 +462,15 @@ router.post('/:id/limits/lower', requireRole('conservator'), async (req, res, ne
         { auditAction: 'limit.lower' }
       );
 
-      // 上限下调：同一展品锁事务内重算分级预警边沿（可能向上跨档）
-      const { events: alertEvents } = await alerts.recomputeAlerts(
-        client, exhibitId, { actor: req.sessionUser, trigger: { type: 'limit.change', detail: {
-          year, previousLimit, newLimit: limitLxh, viaVoucher: true,
-        } } }
-      );
+      // 上限下调：同一展品锁事务内局部重算该年（占用不变、上限变，边沿按最新上限判定）
+      const alertEvents = (await recomputeExhibitUsage(
+        client, exhibitId, [year], {
+          actor: req.sessionUser,
+          trigger: { type: 'limit.change', detail: {
+            year, previousLimit, newLimit: limitLxh, viaVoucher: true,
+          } },
+        }
+      )).events;
 
       // 成功响应与既有额度修改接口兼容：展品详情字段位于顶层
       const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
@@ -502,12 +558,16 @@ router.post('/:id/limits', requireRole('conservator'), async (req, res, next) =>
         });
       }
 
-      // 上限变更：在同一展品锁事务内按统一剂量口径重算分级预警边沿（上限下调路径同样适用）
-      const { events: alertEvents } = await alerts.recomputeAlerts(
-        client, exhibitId, { actor: req.sessionUser, trigger: { type: 'limit.change', detail: {
-          year, previousLimit, newLimit: limitLxh,
-        } } }
-      );
+      // 上限变更：在同一展品锁事务内按统一剂量口径局部重算该年的派生占用与预警边沿
+      // （上限下调路径同样适用；占用不变、上限变）。
+      const alertEvents = (await recomputeExhibitUsage(
+        client, exhibitId, [year], {
+          actor: req.sessionUser,
+          trigger: { type: 'limit.change', detail: {
+            year, previousLimit, newLimit: limitLxh,
+          } },
+        }
+      )).events;
 
       const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
       return {

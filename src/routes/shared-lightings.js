@@ -31,10 +31,8 @@ const {
   loadSharedLightingView,
   getOccupyingPlans,
   plansToFlag,
-  computeOccupancy,
 } = require('../service');
 const { wallToTs, tsToWallString, doseByYear, yearMapToObject } = require('../dosing');
-const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -199,16 +197,20 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
             })),
           });
 
-        // 逐展品重算占用并收集超额（本次归属剂量影响到的年份为限）；超限仍入账。
+        // 逐展品局部重算本次归属剂量影响到的年份并收集超额；超限仍入账。
+        const { recomputeExhibitUsage, refreshUsageYears } = require('../usage');
         const overflowsByExhibit = [];
         const flaggedPlansByExhibit = [];
         const alertEventsByExhibit = [];
         const exhibitDetails = [];
         for (const exId of exhibitIds) {
-          const occupancy = await computeOccupancy(client, exId);
           const allocsHere = allocations.filter((a) => a.exhibitId === exId);
           const candidateYears = new Set();
           for (const a of allocsHere) for (const y of Object.keys(a.yearly)) candidateYears.add(Number(y));
+          const affectedYears = [...candidateYears];
+
+          // 阶段一：先按新入账的归属重算派生占用（同事务、仅限受影响年份，不写预警事件）。
+          let occupancy = await refreshUsageYears(client, exId, affectedYears);
 
           const overflows = [];
           const overflowYears = [];
@@ -252,16 +254,19 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
             }
           }
 
-          // 共享照明归属入账（含可能的待复核转态）后：同一多展品事务内逐展品重算分级预警边沿。
-          // 整次登记回滚时，归属/计划状态与预警事件一并回滚。
-          const { events: alertEvents } = await alerts.recomputeAlerts(client, exId, {
-            actor: req.sessionUser,
-            trigger: {
-              type: 'shared_lighting.create',
-              detail: { sharedLightingId: sessionId, hallCode: input.hallCode },
-            },
-          });
-          alertEventsByExhibit.push({ exhibitId: exId, events: alertEvents });
+          // 阶段二：待复核转态完成后，以最终占用再局部重算一次派生占用并判定预警边沿
+          // （同一多展品事务；整次登记回滚时归属/计划状态/派生占用/预警事件一并回滚）。
+          const { occupancy: finalOcc, events } = await recomputeExhibitUsage(
+            client, exId, affectedYears, {
+              actor: req.sessionUser,
+              trigger: {
+                type: 'shared_lighting.create',
+                detail: { sharedLightingId: sessionId, hallCode: input.hallCode },
+              },
+            }
+          );
+          occupancy = finalOcc;
+          alertEventsByExhibit.push({ exhibitId: exId, events });
         }
 
         // 刷新各展品详情（含被转待复核后的状态）

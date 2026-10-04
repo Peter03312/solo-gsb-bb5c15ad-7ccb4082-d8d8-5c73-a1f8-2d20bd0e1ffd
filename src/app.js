@@ -20,6 +20,7 @@ const residenceRoutes = require('./routes/residences');
 const sharedLightingRoutes = require('./routes/shared-lightings');
 const ledgerRoutes = require('./routes/ledgers');
 const alertRoutes = require('./routes/alerts');
+const maintenanceRoutes = require('./routes/maintenance');
 const auditRoutes = require('./routes/audit');
 
 function createApp() {
@@ -44,6 +45,7 @@ function createApp() {
   app.use('/api/shared-lightings', sharedLightingRoutes.router);
   app.use('/api/exhibits/:id/ledgers', ledgerRoutes);
   app.use('/api', alertRoutes);
+  app.use('/api/maintenance', maintenanceRoutes);
   app.use('/api/audit', auditRoutes);
 
   // JSON 解析错误

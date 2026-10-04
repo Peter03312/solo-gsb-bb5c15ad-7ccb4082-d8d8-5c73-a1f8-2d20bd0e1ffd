@@ -17,7 +17,6 @@ const {
   registerBlackout,
 } = require('../service');
 const { wallToTs, tsToWallString, yearMapToObject, doseByYear } = require('../dosing');
-const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -160,13 +159,16 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
         estimatedDeductionYearly: yearly,
       });
 
-      // 停灯扣减估算后占用下降：锁事务内重算预警（回落不写事件，仅刷新最近级别）
-      const { events: alertEvents } = await alerts.recomputeAlerts(
-        client, plan.exhibit_id, {
+      // 停灯扣减估算后占用下降：锁事务内仅重算扣减量涉及的自然年
+      // （回落不写事件，仅刷新最近级别与派生占用行）。
+      const { recomputeExhibitUsage } = require('../usage');
+      const affectedYears = Object.keys(yearly).map(Number);
+      const alertEvents = (await recomputeExhibitUsage(
+        client, plan.exhibit_id, affectedYears, {
           actor: req.sessionUser,
           trigger: { type: 'blackout.create', detail: { blackoutId: Number(row.id), planId: plan.id, yearly } },
         }
-      );
+      )).events;
 
       const { exhibitDetail } = require('./exhibits');
       const detailAfter = await exhibitDetail(client, plan.exhibit_id, { lock: true });

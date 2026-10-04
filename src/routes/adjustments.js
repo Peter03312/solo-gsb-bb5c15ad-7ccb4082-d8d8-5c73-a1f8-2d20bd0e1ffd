@@ -18,7 +18,16 @@ const {
   dateYmd,
 } = require('../service');
 const { exhibitDetail } = require('./exhibits');
-const alerts = require('../alerts');
+const { recomputeExhibitUsage } = require('../usage');
+
+/** 两份“按年剂量”对象键的并集（调整生效时旧贡献撤回、新贡献计入的受影响年份）。 */
+function unionYearKeys(...yearlyList) {
+  const years = new Set();
+  for (const yearly of yearlyList) {
+    for (const y of Object.keys(yearly || {})) years.add(Number(y));
+  }
+  return [...years];
+}
 
 const router = express.Router();
 
@@ -584,14 +593,21 @@ router.post('/pair/approve', requireRole('conservator'), async (req, res, next) 
         });
       }
 
-      // 成对核准生效后同一展品锁事务内重算分级预警边沿（失败回滚时事件一并回滚）
-      const { events: alertEvents } = await alerts.recomputeAlerts(client, exhibitId, {
-        actor: req.sessionUser,
-        trigger: {
-          type: 'plan.adjustment.pair_approve',
-          detail: { adjustmentIds: [idA, idB], planIds: [planA.id, planB.id] },
-        },
-      });
+      // 成对核准生效后同一展品锁事务内对两份申请“旧/新残余年份并集”局部重算
+      // （失败回滚时派生占用与预警事件一并回滚）。
+      const affectedYears = unionYearKeys(
+        ...evalResult.items.map((it) => it.oldResidueYearly),
+        ...evalResult.items.map((it) => it.newResidueYearly)
+      );
+      const alertEvents = (await recomputeExhibitUsage(
+        client, exhibitId, affectedYears, {
+          actor: req.sessionUser,
+          trigger: {
+            type: 'plan.adjustment.pair_approve',
+            detail: { adjustmentIds: [idA, idB], planIds: [planA.id, planB.id] },
+          },
+        }
+      )).events;
 
       const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
       return {
@@ -704,18 +720,22 @@ router.post('/:id/approve', requireRole('conservator'), async (req, res, next) =
         newResidueYearly: evalResult.newResidueYearly,
       });
 
-      // 调整生效后占用可能变化：同一展品锁事务内重算分级预警边沿
-      const { events: alertEvents } = await alerts.recomputeAlerts(client, plan.exhibit_id, {
-        actor: req.sessionUser,
-        trigger: {
-          type: 'plan.adjustment.approve',
-          detail: {
-            adjustmentId: id, planId: plan.id,
-            oldResidueYearly: evalResult.oldResidueYearly,
-            newResidueYearly: evalResult.newResidueYearly,
+      // 调整生效后占用可能变化：同一展品锁事务内对“原残余/拟改残余年份并集”局部重算
+      // （旧贡献撤回、新贡献计入），派生占用与分级预警边沿同事务更新。
+      const affectedYears = unionYearKeys(evalResult.oldResidueYearly, evalResult.newResidueYearly);
+      const alertEvents = (await recomputeExhibitUsage(
+        client, plan.exhibit_id, affectedYears, {
+          actor: req.sessionUser,
+          trigger: {
+            type: 'plan.adjustment.approve',
+            detail: {
+              adjustmentId: id, planId: plan.id,
+              oldResidueYearly: evalResult.oldResidueYearly,
+              newResidueYearly: evalResult.newResidueYearly,
+            },
           },
-        },
-      });
+        }
+      )).events;
 
       return {
         ...(await exhibitDetail(client, plan.exhibit_id, { lock: true })),

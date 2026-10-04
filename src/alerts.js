@@ -82,6 +82,10 @@ async function upsertThreshold(client, exhibitId, input, actor) {
   const limit = info && info.limit !== null && info.limit !== undefined ? info.limit : null;
   const baselineLevel = levelOf({ used, limit, lowPct, highPct });
 
+  // 阈值基线同样以派生占用表为准：确保该年 annual_usage 行存在（按年局部重算，重建基线不补发事件）。
+  const { refreshUsageYears } = require('./usage');
+  await refreshUsageYears(client, exhibitId, [year]);
+
   const { rows: prevRows } = await client.query(
     'SELECT id, low_pct, high_pct FROM annual_quota_thresholds WHERE exhibit_id = $1 AND year = $2',
     [exhibitId, year]
@@ -134,7 +138,7 @@ async function upsertThreshold(client, exhibitId, input, actor) {
     }
   );
 
-  return { row, rebased: { used, level: baselineLevel, hasLimit: limit !== null } };
+  return { row, rebased: { used, level: baselineLevel, hasLimit: limit !== null, limit } };
 }
 
 /**
@@ -148,13 +152,21 @@ async function upsertThreshold(client, exhibitId, input, actor) {
  *
  * options:
  *   occupancy  已在同事务内算好的占用（避免重复计算）；省略则自行计算；
+ *   years      仅重算这些“受影响自然年”的阈值（按年局部重算）；省略则重算全部阈值年份；
  *   actor      事件 created_by（触发操作的操作者）；
  *   trigger    { type, detail } 触发来源（写入事件审计快照）。
  * 返回 { events: [对外事件对象…] }（不含已读标记查询）。
  */
-async function recomputeAlerts(client, exhibitId, { occupancy = null, actor = null, trigger = null } = {}) {
-  const occ = occupancy || (await computeOccupancy(client, exhibitId));
-  const rows = await getThresholdRows(client, exhibitId);
+async function recomputeAlerts(client, exhibitId, {
+  occupancy = null,
+  years = null,
+  actor = null,
+  trigger = null,
+} = {}) {
+  const occ = occupancy || (await computeOccupancy(client, exhibitId, years ? { years } : {}));
+  const allRows = await getThresholdRows(client, exhibitId);
+  const yearFilter = years ? new Set(years.map(Number)) : null;
+  const rows = yearFilter ? allRows.filter((r) => yearFilter.has(Number(r.year))) : allRows;
   const created = [];
 
   for (const row of rows) {
@@ -254,6 +266,28 @@ async function buildThresholdView(client, exhibitId, occ = null) {
   const occupancy = occ || (await computeOccupancy(client, exhibitId));
   const rows = await getThresholdRows(client, exhibitId);
   return rows.map((row) => serializeThresholdRow(row, occupancy.years[String(row.year)]));
+}
+
+/**
+ * 以派生占用表 annual_usage + 年上限组装阈值视图（展品列表等批量读取场景用，
+ * 与 buildThresholdView 同一级别/舍入口径，不做全量历史重算）。
+ * usageByYear/limitsByYear 为 { [year]: Number|row }；
+ * 阈值年份在两表中都缺失时 used=0、limit=null（“无上限”，级别 none）。
+ */
+function buildThresholdViewFromUsage(rows, { usageByYear = {}, limitsByYear = {} } = {}) {
+  return rows.map((row) => {
+    const year = Number(row.year);
+    const key = String(year);
+    const limitRaw = limitsByYear[key];
+    const limit = limitRaw === null || limitRaw === undefined
+      ? null
+      : round3(typeof limitRaw === 'object' ? Number(limitRaw.limit_lxh) : Number(limitRaw));
+    const usageRaw = usageByYear[key];
+    const used = usageRaw === null || usageRaw === undefined
+      ? 0
+      : round3(typeof usageRaw === 'object' ? Number(usageRaw.used_lxh) : Number(usageRaw));
+    return serializeThresholdRow(row, { year, limit, used });
+  });
 }
 
 /** 事件行 -> 对外对象（驼峰）。 */
@@ -356,6 +390,7 @@ module.exports = {
   upsertThreshold,
   recomputeAlerts,
   buildThresholdView,
+  buildThresholdViewFromUsage,
   serializeThresholdRow,
   serializeAlertRow,
   listAlerts,

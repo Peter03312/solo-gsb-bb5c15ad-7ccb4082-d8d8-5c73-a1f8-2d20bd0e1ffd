@@ -190,6 +190,22 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       `quotaAlerts` / `quotaAlertsUnread`，列表仅附加级别计数，触发操作响应仅附加
       `quotaAlertEvents`）。审计记录 `quota_threshold.create` / `quota_threshold.update`。
 
+22. **年度占用按受影响自然年局部重算（统一派生机制）**：年度占用不再在每次读取时全量扫描历史，
+    而是维护派生表 `annual_usage`（展品 + 自然年：`used` 及实测/事故/共享照明/估算残余四个组成部分）。
+    - **单一来源与舍入口径**：展品详情、审批与复核、调整/成对核准试算、联合核准、上限下调预演、
+      封存账册当前值、分级预警、展品列表概况全部沿用同一统一剂量口径与 `round3` 舍入；
+      派生表只是该口径按年缓存，字段、超限冲突明细（`details.overflows` 等）与审计全部保持兼容。
+    - **变更事务内按年局部重算**：计划批准、取消、调整（含成对/联合核准）、实测确认、实测纠错、
+      停灯登记、计划外事故、展厅共享照明、年度上限变更，都在**原有的展品/展厅锁事务**内、
+      业务写入完成后只重算**本次受影响自然年**：跨年记录影响到的每个年份同步处理；
+      作废或替换（实测纠错、计划调整、取消）按**旧贡献年份与新贡献年份的并集**重算，
+      即先撤回旧贡献再计入新贡献；单次变更**不扫描无关年份的全部历史记录**。
+    - **预警同事务**：分级预警边沿只对同一批受影响年份判定，占用结果与预警事件在同一事务
+      提交或回滚；**多展品操作（联合核准、共享照明）失败时占用结果与预警事件一并回滚**。
+    - **派生结果可重建**：既有数据可通过脚本或 HTTP 维护接口全量重建（见下文「派生占用重建」）；
+      启动时若 `annual_usage` 为空（旧库升级首启）会自动按展品加锁重建；**重建失败会报错并中止，
+      绝不返回新旧占用混杂的结果**。
+
 ## 一键启动（Docker Compose）
 
 前置：已安装 Docker 与 Docker Compose（v2）。
@@ -254,6 +270,51 @@ PGHOST=127.0.0.1 PGUSER=lightquota PGPASSWORD=lightquota_secret npm start
 ```bash
 npm run test:utils
 ```
+
+端到端业务流程测试（基于 pg-mem，含局部重算/跨年/回滚/重建核对）：
+
+```bash
+npm test
+```
+
+## 派生占用重建（annual_usage）
+
+`annual_usage` 是由计划/实测/停灯/事故/共享照明/上限等源数据按统一剂量口径派生的年度占用表，
+可随时从源数据全量重建（幂等）。以下三种方式等价，均按展品逐个加展品锁、在事务内
+「先删旧派生行 → 按统一口径逐年写回 → 同步预警阈值最近占用/级别（不补发事件）」，
+**任一展品任一年份不一致即报错回滚，绝不保留新旧占用混杂的结果**：
+
+```bash
+# 1) 命令行：重建全部展品（也可只重建指定展品 id）
+npm run rebuild:usage
+npm run rebuild:usage -- 3 5
+
+# 2) Docker Compose 容器内执行
+docker compose exec app node scripts/rebuild-usage.js
+
+# 3) HTTP 维护接口（仅保管员）：全量或按展品
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/maintenance/rebuild-usage \
+  -H 'Content-Type: application/json' -d '{}'
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/maintenance/rebuild-usage \
+  -H 'Content-Type: application/json' -d '{"exhibitIds":[3,5]}'
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "exhibitCount": 2,
+  "yearCount": 7,
+  "exhibits": [
+    { "exhibitId": 3, "yearCount": 4, "years": [2024, 2025, 2026, 2027] },
+    { "exhibitId": 5, "yearCount": 3, "years": [2025, 2026, 2027] }
+  ]
+}
+```
+
+旧库升级后首次启动时若 `annual_usage` 为空，应用会自动完成一次同样的全量重建再对外服务
+（重建失败则启动中止）；日常运行中所有占用变更都只在对应展品锁事务内按受影响年份局部重算。
 
 ## 使用流程
 
@@ -380,6 +441,18 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `GET /api/shared-lightings?hallCode=&exhibitId=` | 登录 | **共享照明**列表（按归属展品逐条返回，附按年实际用光、窗内/窗外拆分与归属段） |
 | `POST /api/shared-lightings` | 保管员 | **登记一次展厅共享照明**；按驻留交集归属多展品、跨年拆分；冲突整次拒绝（409 `details.conflictsByExhibit`）；超限仍入账返回 **409**（各展品超额年份） |
 | `GET /api/audit` | 保管员 | 操作流水（含 `blackout.create`、`incident.create`、`plan.flag_review_incident`、`residence.create`、`shared_lighting.create`、`plan.flag_review_shared_lighting`） |
+
+### 维护接口（conservator）
+
+| 方法 & 路径 | 角色 | 说明 |
+| --- | --- | --- |
+| `POST /api/maintenance/rebuild-usage` | 保管员 | **全量（或按展品）重建派生占用表** `annual_usage`：逐展品加锁事务，先删旧行再按统一口径逐年写回并同步预警阈值最近状态（不补发事件）；任一失败回滚并报错，不产生新旧混杂占用。body `{}` 为全部展品，`{"exhibitIds":[3,5]}` 为指定展品 |
+
+```bash
+# 保管员登录后全量重建
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/maintenance/rebuild-usage \
+  -H 'Content-Type: application/json' -d '{}'
+```
 
 ### 计划调整申请 `/api/adjustments`
 
@@ -1458,14 +1531,17 @@ src/
   audit.js         操作流水写入
   limit-preview.js 下调上限预演凭证（签发/一次性消耗/占用指纹）
   alerts.js        年度用光分级预警：阈值校验/基线重建、占用向上跨档边沿判定与事件写入、查询与已读标记
+  usage.js         年度占用统一派生机制：按受影响自然年局部重算 annual_usage（撤回旧贡献→计入新贡献）、
+                   同事务刷新预警边沿、全量重建（展品加锁事务，失败报错不混杂）
   validation.js    中文输入校验（时段/日期/正数等）
   csv.js           实测 CSV 批次解析（表头识别、墙上日期时间、逐行取值校验）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
   ledger.js        年度用光账册封存：按年快照构建（复用统一占用口径）、封存校验落账、封存值与当前重算的逐项/合计差额对照
-  service.js       额度占用计算、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减、计划外照明事故登记校验/窗内替代窗外单独计量口径、展厅驻留登记/覆盖校验、共享照明按驻留交集归属/跨年拆分/多展品原子登记与冲突收集/超限处理、实测批次逐行评估（窗口/相交/行间相交）与确认超限处理
-  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/measurement-batches（实测 CSV 批次导入：预览/导入/确认）/blackouts/incidents（计划外照明事故）/residences（展厅与驻留登记/改删）/shared-lightings（共享照明登记与只读查询）/ledgers（年度账册封存与对照）/alerts（分级预警阈值设置、事件历史查询与已读标记）/audit 路由
+  service.js       额度占用计算（支持按受影响自然年的局部重算，复用同一来源/舍入口径）、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减、计划外照明事故登记校验/窗内替代窗外单独计量口径、展厅驻留登记/覆盖校验、共享照明按驻留交集归属/跨年拆分/多展品原子登记与冲突收集/超限处理、实测批次逐行评估（窗口/相交/行间相交）与确认超限处理
+  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/measurement-batches（实测 CSV 批次导入：预览/导入/确认）/blackouts/incidents（计划外照明事故）/residences（展厅与驻留登记/改删）/shared-lightings（共享照明登记与只读查询）/ledgers（年度账册封存与对照）/alerts（分级预警阈值设置、事件历史查询与已读标记）/maintenance（派生占用全量重建）/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
-scripts/test-integration.js  基于 pg-mem 的端到端业务流程测试（含年度账册封存/对照/并发、分级预警基线/边沿触发/回落重触发/无上限/跨年/回滚/已读）
+scripts/test-integration.js  基于 pg-mem 的端到端业务流程测试（含年度账册封存/对照/并发、分级预警基线/边沿触发/回落重触发/无上限/跨年/回滚/已读、占用按年局部重算/跨年并集/纠错换贡献/回滚/HTTP 与离线重建）
+scripts/rebuild-usage.js  annual_usage 派生占用全量重建（npm run rebuild:usage，等价于维护接口）
 Dockerfile / docker-compose.yml
 ```
